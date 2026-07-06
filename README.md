@@ -1,126 +1,86 @@
 # polymarket-MM
 
-BTC/Polymarket arbitrage tool — uses historical volatility to estimate the probability of BTC reaching specific price levels, compares with Polymarket's "Bitcoin above $X?" market pricing, and bets when the model finds a pricing discrepancy.
+Polymarket 流動性獎勵（LP）動態掛單機器人。在指定子市場的中間價附近**雙邊掛限價單**（買 Yes + 買 No）賺取每日流動性獎勵，並定時全撤重掛以降低被吃單機率；偵測到成交就市價平倉、進入冷卻，儘量不留倉。
 
-## How It Works
+## 運作原理
 
-### Core Concept
+### 獎勵規則
+Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 
-Polymarket runs daily binary markets like "Bitcoin above $74,000 on March 16?" with ~11 strike prices per day, spaced $2K apart. Settlement is based on Binance BTC/USDT 1-min candle **close** at **noon ET**.
+- 計分公式 **S(v, s) = ((v − s) / v)² · b**，`v` = 市場 `max spread`、`s` = 掛單距中間價的點差。**越貼中間價，分數呈二次成長**。
+- 只有份額 **≥ `rewardsMinSize`** 的掛單才計分。
+- 中間價落在 [0.10, 0.90] 時單邊也計分但分數 ÷ 3；**雙邊掛單分數最高**。
+- 每分鐘抽樣、每日 UTC 午夜結算，依當日分數占比分配該市場獎勵池（單日 < $1 不發放）。
 
-This tool calculates the statistical probability of BTC reaching each strike, compares it with Polymarket's Yes price, and identifies mispriced markets.
+### 免持倉雙邊結構
+- 買 Yes @ `(mid − offset)` + 買 No @ `((1 − mid) − offset)`
+- 買 No 等同賣 Yes（計分算另一邊），兩單各在自己的 order book，`bidYes + bidNo = 1 − 2·offset < 1`，**永不互相成交**。
+- `post_only` 保證只當 maker（會穿價則被拒）。
 
-### Probability Models
+### 主迴圈（`lp_maker.py`）
+1. 偵測庫存（Yes / No 條件代幣餘額）；若被吃出部位 → 市價平倉（FAK）→ 進入冷卻（點差加倍）。
+2. 否則：全撤該市場掛單 → 取中間價 → 掛買 Yes / 買 No（`post_only`）。
+3. 每 `REFRESH_INTERVAL` 秒重複。
 
-**Gaussian Method**
-- Rolling std from last 20 hourly candle closes
-- Projects std forward: `hourly_std × √(hours_remaining)`
-- Uses normal CDF: `P(BTC > strike) = 1 - Φ(strike, current_price, projected_std)`
+## 設定（全部從 `.env` 讀取）
 
-**Historical Method**
-- Takes all hourly candles from the past 90 days
-- For each candle, looks N hours forward (where N = hours until settlement)
-- Maps those returns to current price
-- Counts what percentage exceed the strike
+| Key | 預設 | 說明 |
+|-----|------|------|
+| `MARKET_SLUG` | `nba-lebron-james-next-team` | 目標事件 slug |
+| `MARKET_MATCH` | `Cleveland Cavaliers` | 用來在事件內定位子市場的 question 關鍵字 |
+| `OFFSET_CENTS` | `1.0` | 掛單距中間價的點差（¢）。越小獎勵越高但越易被吃，需 ≤ 市場 max spread |
+| `ORDER_SIZE` | `200` | 每邊掛單股數，需 ≥ 市場 `rewardsMinSize` 才計獎勵 |
+| `REFRESH_INTERVAL` | `15` | 全撤重掛間隔（秒） |
+| `COOLDOWN` | `60` | 被吃單後的冷卻秒數（期間點差加倍） |
+| `DRY_RUN` | `true` | `true` 只計算列印、不下單，執行一次後結束 |
+| `LOG_DIR` | `log` | log 存放資料夾（同時輸出 console 與 `LOG_DIR/YYYY-MM-DD.txt`） |
+| `LOG_LEVEL` | `INFO` | log 等級（DEBUG / INFO / WARNING / ERROR） |
+| `ALERT_SOUND` | `/System/Library/Sounds/Glass.aiff` | 成交時播放的提示音（macOS afplay），留空則關閉 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | 成交/平倉時發 Telegram 通知，留空則不通知 |
+| `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_FUNDER` / `POLYMARKET_PROXY` | — | 錢包與代理設定 |
 
-### Signal Logic
-
-```
-edge = model_probability - polymarket_yes_price
-```
-
-If `histEdge > 8%` → Buy Yes (market is underpricing the probability).
-
-## Backtest Results
-
-**Date range**: 2026-03-07 ~ 2026-04-06 (30 days, 330 data points)
-
-| Strategy | Trades | Win Rate | PnL (per $1 bet) |
-|----------|--------|----------|-------------------|
-| Gaussian (gaussEdge > 8%) | 14 | 14.3% | -$10.27 |
-| Historical (histEdge > 8%) | 9 | 44.4% | -$3.75 |
-| Both (gauss + hist > 8%) | 4 | 0.0% | -$4.00 |
-
-> Note: Results vary significantly across different market regimes. The historical method shows better calibration than Gaussian due to BTC's leptokurtic (fat-tailed) distribution.
-
-## Parameters
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `BOLLINGER_WINDOW` | 20 | Rolling std window (hourly candles) |
-| `HIST_LOOKBACK` | 90 days | Historical sample period |
-| `MIN_EDGE` | 8% | Minimum edge to trigger a bet |
-| `SIGNAL_HOUR_UTC` | 9 (backtest default) | Signal check time |
-| `TRADE_HOUR_UTC` | 11 | Auto-trade execution hour (best from hourly comparison) |
-| `BET_SIZE` | $5 USDC | Minimum order size on Polymarket |
-| `MAX_DAILY_BETS` | 1 | Daily bet limit |
-
-## Project Structure
+## 專案結構
 
 ```
-├── daily_signal.py      # Real-time monitor + auto-trading
-├── backtest.py          # Historical backtesting engine
-├── plotPerformance.py   # Performance chart generator
-├── backtest.ipynb       # Interactive analysis notebook
-├── bollinger_prob.py    # Probability calculation (Gaussian + Historical)
-├── btc_data.py          # Binance BTC/USDT hourly klines
-├── polymarket_data.py   # Polymarket Gamma + CLOB API
-├── approve.py           # One-time USDC approval for Polymarket contracts
-├── test_order.py        # Order placement test script
+├── lp_maker.py          # LP 動態掛單機器人（主程式）
+├── notifier.py          # Telegram 成交/平倉通知
+├── polymarket_data.py   # Polymarket Gamma / CLOB API 資料抓取
+├── approve.py           # 一次性：approve USDC + CTF 給 Polymarket 合約
+├── test_order.py        # 下單環境測試腳本
 └── requirements.txt
 ```
 
-## Setup
+## 安裝
 
 ```bash
-# Create venv (Python 3.9.10+)
 python3.12 -m venv venv
-
-# Install dependencies
 venv/bin/pip install -r requirements.txt
 
-# Configure .env
-cat > .env << 'EOF'
-POLYMARKET_PRIVATE_KEY=0x...
-POLYMARKET_FUNDER=0x...
-POLYMARKET_PROXY=http://user:pass@ip:port
-EOF
-
-# One-time: approve USDC for Polymarket contracts
+# .env 已含錢包設定；首次需授權（只做一次）
 venv/bin/python approve.py
 ```
 
-## Usage
+## 使用
 
-### Daily Signal (one-shot)
 ```bash
-venv/bin/python daily_signal.py
+# 1. 環境檢查（ClobClient 初始化 + 餘額 / allowance）
+venv/bin/python test_order.py
+
+# 2. 乾跑（.env 設 DRY_RUN=true）：印出鎖定的市場、中間價、雙邊掛單價，不下單
+venv/bin/python lp_maker.py
+
+# 3. 實跑（.env 設 DRY_RUN=false）：開始動態雙邊掛單，Ctrl+C 停止並清空掛單
+venv/bin/python lp_maker.py
 ```
 
-### Monitor Mode (continuous, every 60s)
-```bash
-venv/bin/python daily_signal.py --monitor
-```
+## Proxy（必要）
+Polymarket **交易**對部分地區（含台灣）做地區封鎖，讀取／認證不封。因此下單一定要透過 `POLYMARKET_PROXY`，且該 proxy 的**出口需在允許地區**（如西班牙）。程式啟動時會印出對外出口 IP／國家，若 proxy 不通會直接報錯。CLOB 於 2026-04 升級到 V2，本專案使用 `py-clob-client-v2`（舊版 `py-clob-client` 產生的訂單會被拒）。
 
-### Auto-Trade Mode
-```bash
-venv/bin/python daily_signal.py --monitor --auto-trade
-```
-Only places orders during `TRADE_HOUR_UTC` (UTC 11 / Taiwan 19:00). Proxy is only used for order placement.
+## 風險提醒
+- `OFFSET_CENTS` 越小獎勵越高但越易被吃；15 秒重掛僅降低、無法消除被吃機率。
+- 雙邊皆成交＝持有 Yes + No 的鎖定 $1 對（無方向風險），平倉會付兩次點差。
+- 平倉走 taker 會付點差成本；長期淨損益 = 獎勵 − 被吃平倉的點差成本，需自行觀察是否為正。
 
-### Run Backtest
-```bash
-venv/bin/python backtest.py
-```
-Outputs `backtest_results.csv`, trade logs, and hourly comparison table.
-
-### Generate Performance Chart
-```bash
-venv/bin/python plotPerformance.py
-```
-
-## Data Sources
-
-- **BTC Price**: Binance API (`/api/v3/klines`, BTC/USDT 1h)
-- **Market Data**: Polymarket Gamma API (`gamma-api.polymarket.com/events`)
-- **Historical Pricing**: Polymarket CLOB API (`clob.polymarket.com/prices-history`)
+## 資料來源
+- 市場資料：Polymarket Gamma API（`gamma-api.polymarket.com/events`）
+- 下單 / 撤單 / 取價：Polymarket CLOB V2（`clob.polymarket.com`，透過 `py-clob-client-v2`）

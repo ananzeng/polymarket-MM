@@ -5,4 +5,5 @@ __pycache__/
 *.csv
 *.png
 temp/
+log/
 .DS_Store

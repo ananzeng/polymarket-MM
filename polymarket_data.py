@@ -1,7 +1,7 @@
 """
-Polymarket「Bitcoin above ___ on [date]?」市場數據抓取
+Fetch Polymarket "Bitcoin above ___ on [date]?" market data.
 
-結算規則：Binance BTC/USDT 正午 ET 那根 1 分鐘 K 線收盤價 >= $X → Yes 勝
+Settlement rule: if the Binance BTC/USDT 1-minute candle close at noon ET is >= $X, Yes wins.
 """
 import re
 import time
@@ -44,19 +44,19 @@ def fetchEventBySlug(slug: str) -> Optional[dict]:
         data = resp.json()
         return data[0] if data else None
     except Exception as e:
-        logger.warning("fetchEventBySlug %s 失敗：%s", slug, e)
+        logger.warning("fetchEventBySlug %s failed: %s", slug, e)
         return None
 
 
 def parseEventMarkets(event: dict) -> list:
     """
-    解析事件的所有市場
+    Parse all markets of an event.
 
     Returns list of:
     {
         question, targetPrice,
         yesPrice, noPrice,
-        yesWon,   # True / False / None（未結算）
+        yesWon,   # True / False / None (unsettled)
         closed,
         volume,
         clobYesTokenId, clobNoTokenId,
@@ -87,14 +87,14 @@ def parseEventMarkets(event: dict) -> list:
         outcomesNoPrice = float(outcomePrices[1]) if len(outcomePrices) > 1 else None
         isClosed = m.get("closed", False)
 
-        # lastTradePrice = 最後實際成交價，和網站顯示一致
-        # 進行中的市場用 lastTradePrice，已結算用 outcomePrices 判斷勝負
+        # lastTradePrice = last actual traded price, matches what the site shows.
+        # In-progress markets use lastTradePrice; settled ones use outcomePrices to decide the winner.
         lastTradePrice = m.get("lastTradePrice")
         if lastTradePrice is not None:
             lastTradePrice = float(lastTradePrice)
 
-        # 進行中：用 lastTradePrice 作為 Yes 定價
-        # 結算後：outcomePrices 會變成 1 或 0
+        # In progress: use lastTradePrice as the Yes price.
+        # After settlement: outcomePrices becomes 1 or 0.
         if isClosed:
             yesPrice = outcomesYesPrice
         else:
@@ -120,7 +120,7 @@ def parseEventMarkets(event: dict) -> list:
 
 def fetchDailyAboveEvent(targetDate: date) -> Optional[dict]:
     """
-    抓取某日的 bitcoin-above 事件
+    Fetch the bitcoin-above event for a given day.
 
     Returns:
         { targetDate, slug, eventId, volume, markets } or None
@@ -145,10 +145,10 @@ def fetchDailyAboveEvent(targetDate: date) -> Optional[dict]:
 
 def fetchClobPriceHistory(tokenId: str) -> list:
     """
-    從 CLOB API 抓取某個 token 的完整歷史定價（每小時一筆）
+    Fetch a token's full price history from the CLOB API (one point per hour).
 
     Returns:
-        list of {"t": unix_ts, "p": float}，按時間升序
+        list of {"t": unix_ts, "p": float}, in ascending time order
     """
     try:
         resp = requests.get(f"{CLOB_URL}/prices-history", params={
@@ -159,13 +159,13 @@ def fetchClobPriceHistory(tokenId: str) -> list:
         resp.raise_for_status()
         return resp.json().get("history", [])
     except Exception as e:
-        logger.warning("fetchClobPriceHistory %s 失敗：%s", tokenId[:20], e)
+        logger.warning("fetchClobPriceHistory %s failed: %s", tokenId[:20], e)
         return []
 
 
 def getPriceAtTime(history: list, targetDt: datetime) -> Optional[float]:
     """
-    從歷史定價序列中，找到 targetDt 前最近一筆的價格
+    Find the most recent price at or before targetDt in the price-history series.
 
     Args:
         history:  list of {"t": unix_ts, "p": float}
@@ -190,12 +190,12 @@ def enrichMarketsWithClobPrices(
     delaySeconds: float = 0.2,
 ) -> list:
     """
-    對每個市場，用 CLOB prices-history 補上 signalDt 時的定價
+    For each market, backfill the price at signalDt using CLOB prices-history.
 
-    結果會新增 key：
-        clobYesPriceAtSignal  - 下注時間點的 Yes 定價（回測用）
+    Adds key:
+        clobYesPriceAtSignal  - the Yes price at bet time (for backtesting)
 
-    已結算（closed=True）的市場才需要補，進行中的用 lastTradePrice 即可
+    Only settled (closed=True) markets need backfilling; in-progress ones can use lastTradePrice.
     """
     enriched = []
     for m in markets:
@@ -216,7 +216,7 @@ def fetchAllClobHistories(
     delaySeconds: float = 0.2,
 ) -> dict:
     """
-    一次抓好所有關卡的 CLOB 歷史定價
+    Fetch CLOB price histories for all strikes at once.
 
     Returns:
         {clobYesTokenId: [{"t": unix_ts, "p": float}, ...]}
@@ -256,25 +256,25 @@ def fetchHistoricalAboveEvents(
     delaySeconds: float = 0.3,
     verbose: bool = True,
 ) -> list:
-    """批量抓取日期範圍內所有 bitcoin-above 事件"""
+    """Batch-fetch all bitcoin-above events within a date range."""
     results = []
     current = startDate
     if verbose:
         total = (endDate - startDate).days + 1
-        print(f"搜尋 {startDate} ~ {endDate} 共 {total} 天...")
+        print(f"Searching {startDate} ~ {endDate}, {total} days total...")
 
     while current <= endDate:
         event = fetchDailyAboveEvent(current)
         if event:
             closedCount = sum(1 for m in event["markets"] if m["closed"])
             if verbose:
-                print(f"  ✓ {current}  {len(event['markets'])} 個關卡（{closedCount} 已結算）  vol=${event['volume']:,.0f}")
+                print(f"  ✓ {current}  {len(event['markets'])} strikes ({closedCount} settled)  vol=${event['volume']:,.0f}")
             results.append(event)
         time.sleep(delaySeconds)
         current += timedelta(days=1)
 
     if verbose:
-        print(f"\n找到 {len(results)} 個有效事件")
+        print(f"\nFound {len(results)} valid events")
     return results
 
 
@@ -284,10 +284,10 @@ if __name__ == "__main__":
 
     event = fetchDailyAboveEvent(date.today())
     if event:
-        print(f"今日事件：{event['slug']}")
-        print(f"交易量：${event['volume']:,.0f}\n")
-        print(f"  {'關卡':>10}  {'Yes定價':>8}  {'No定價':>8}  {'狀態'}")
+        print(f"Today's event: {event['slug']}")
+        print(f"Volume: ${event['volume']:,.0f}\n")
+        print(f"  {'Strike':>10}  {'YesPrice':>8}  {'NoPrice':>8}  {'Status'}")
         print("  " + "-" * 45)
         for m in event["markets"]:
-            status = "✓ Yes勝" if m["yesWon"] is True else ("✗ No勝" if m["yesWon"] is False else "進行中")
+            status = "✓ Yes won" if m["yesWon"] is True else ("✗ No won" if m["yesWon"] is False else "in progress")
             print(f"  ${m['targetPrice']:>9,.0f}  {m['yesPrice']:>8.4f}  {m['noPrice']:>8.4f}  {status}")

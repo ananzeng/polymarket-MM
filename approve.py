@@ -1,7 +1,7 @@
 """
-一次性腳本：approve USDC.e 給 Polymarket 合約
+One-time script: approve USDC.e for the Polymarket contracts.
 
-執行：venv/bin/python approve.py
+Run: venv/bin/python approve.py
 """
 import os
 from dotenv import load_dotenv
@@ -34,13 +34,13 @@ def main():
 
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     if not w3.is_connected():
-        print("無法連線到 Polygon RPC")
+        print("Cannot connect to Polygon RPC")
         return
 
     account = w3.eth.account.from_key(privKey)
     pubKey = account.address
-    print(f"錢包地址：{pubKey}")
-    print(f"POL 餘額：{w3.from_wei(w3.eth.get_balance(pubKey), 'ether'):.4f}\n")
+    print(f"Wallet address: {pubKey}")
+    print(f"POL balance: {w3.from_wei(w3.eth.get_balance(pubKey), 'ether'):.4f}\n")
 
     usdc = w3.eth.contract(address=USDC_ADDRESS, abi=ERC20_ABI)
     ctf = w3.eth.contract(address=CTF_ADDRESS, abi=ERC1155_ABI)
@@ -72,7 +72,7 @@ def main():
         receipt = w3.eth.wait_for_transaction_receipt(txHash, 600)
         print(f"  OK tx: {receipt.transactionHash.hex()}")
 
-    print("\n全部 approve 完成！現在可以下單了。")
+    print("\nAll approvals done! You can place orders now.")
 
 
 if __name__ == "__main__":

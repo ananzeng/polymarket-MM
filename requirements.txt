@@ -1,8 +1,4 @@
-requests
-pandas
-numpy
-scipy
-matplotlib
-jupyter
-py-clob-client
-python-dotenv
+requests==2.32.5
+py-clob-client-v2==1.0.2
+python-dotenv==1.2.2
+web3==7.14.1
