@@ -9,6 +9,7 @@ All parameters are read from .env. Run: venv/bin/python lp_maker.py
 """
 import csv
 import logging
+import math
 import os
 import subprocess
 import time
@@ -264,7 +265,9 @@ class PolymarketMaker:
             logger.error("Failed to place buy %s @ %s: %s", label, price, e)
 
     def _flatten(self, token: str, shares: float, label: str):
-        shares = round(shares, 2)
+        # Floor to the 2-decimal size precision so we never try to sell more than we hold
+        # (round() could round up above the actual balance and get rejected).
+        shares = math.floor(shares * 100) / 100
         logger.info("Flatten: market-sell %s %.2f shares", label, shares)
         if dryRun:
             logger.info("[dryRun] skip flatten")
