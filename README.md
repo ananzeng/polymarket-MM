@@ -30,14 +30,27 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 | `MARKET_MATCH` | `Cleveland Cavaliers` | 用來在事件內定位子市場的 question 關鍵字 |
 | `OFFSET_CENTS` | `1.0` | 掛單距中間價的點差（¢）。越小獎勵越高但越易被吃，需 ≤ 市場 max spread |
 | `ORDER_SIZE` | `200` | 每邊掛單股數，需 ≥ 市場 `rewardsMinSize` 才計獎勵 |
-| `REFRESH_INTERVAL` | `15` | 全撤重掛間隔（秒） |
+| `REFRESH_INTERVAL` | `15` | 主單掛滿多久重掛（秒）。**訂單要掛 ≥ ~25 秒才會被 Polymarket 抽樣計分**，太短賺不到獎勵 |
 | `COOLDOWN` | `60` | 被吃單後的冷卻秒數（期間點差加倍） |
 | `DRY_RUN` | `true` | `true` 只計算列印、不下單，執行一次後結束 |
 | `LOG_DIR` | `log` | log 存放資料夾（同時輸出 console 與 `LOG_DIR/YYYY-MM-DD.txt`） |
 | `LOG_LEVEL` | `INFO` | log 等級（DEBUG / INFO / WARNING / ERROR） |
 | `ALERT_SOUND` | `/System/Library/Sounds/Glass.aiff` | 成交時播放的提示音（macOS afplay），留空則關閉 |
+| `BAIT_ENABLED` | `false` | 啟用誘餌分層模式（見下） |
+| `BAIT_OFFSET_CENTS` | `0.4` | 誘餌距中間價點差（貼盤口，比主單更前面才會先被吃） |
+| `BAIT_SIZE` | `15` | 誘餌股數（< `rewardsMinSize` 不計獎勵，純預警） |
+| `BAIT_TRIGGER_RATIO` | `0.5` | 誘餌被吃到此比例（或主單被吃）就撤主單、平倉、冷卻 |
+| `POLL_INTERVAL` | `1.0` | 分層模式下查各單成交量的間隔（秒） |
+| `SCORING_CHECK_INTERVAL` | `20` | 每隔幾秒查主單是否正在計分（賺獎勵）並 log，`0` 關閉 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | 成交/平倉時發 Telegram 通知，留空則不通知 |
 | `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_FUNDER` / `POLYMARKET_PROXY` | — | 錢包與代理設定 |
+
+### 誘餌分層模式（`BAIT_ENABLED=true`）
+為了賺 LP 獎勵，主單必須掛得夠久（≥ ~25 秒）才會被抽樣計分——但掛久了容易被吃。此模式在盤口最前面放一張小「誘餌單」當預警：
+- **主單**（`OFFSET_CENTS`，如 2.5¢、size ≥ 200）：掛滿 `REFRESH_INTERVAL`（如 45s）賺獎勵。
+- **誘餌**（`BAIT_OFFSET_CENTS`，如 0.4¢、size 小）：貼盤口，賣單先撞它。
+- 每 `POLL_INTERVAL` 秒查各單成交量；當誘餌被吃 ≥ `BAIT_TRIGGER_RATIO`（或主單被吃）→ 撤主單 → 平掉庫存 → 冷卻 → 重掛。
+- 限制：擋不住「一次大單同時掃穿誘餌+主單」（同一撮合事件，來不及反應）；只擋小單/連續流/緩慢漂移。
 
 ## 專案結構
 

@@ -37,6 +37,17 @@ logDir = os.getenv("LOG_DIR", "log")
 logLevel = os.getenv("LOG_LEVEL", "INFO").upper()
 alertSound = os.getenv("ALERT_SOUND", "/System/Library/Sounds/Glass.aiff")
 
+# Bait layer: a small order at the top of book that gets hit first, acting as an early
+# warning. When it is consumed enough (or the main order is hit), retreat the main order.
+baitEnabled = os.getenv("BAIT_ENABLED", "false").lower() == "true"
+baitOffsetCents = float(os.getenv("BAIT_OFFSET_CENTS", "0.4"))
+baitSize = float(os.getenv("BAIT_SIZE", "15"))
+baitTriggerRatio = float(os.getenv("BAIT_TRIGGER_RATIO", "0.5"))
+pollInterval = float(os.getenv("POLL_INTERVAL", "1.0"))
+
+# How often (seconds) to check whether the main orders are scoring (earning rewards); 0 disables.
+scoringCheckInterval = int(os.getenv("SCORING_CHECK_INTERVAL", "20"))
+
 LOG_CSV = os.path.join(logDir, "lp_maker_log.csv")
 DUST_SHARES = 5.0        # inventory below this is treated as dust (min order size is 5, cannot flatten)
 SHARE_DECIMALS = 1_000_000  # conditional token balances have 6 decimals
@@ -161,6 +172,9 @@ class PolymarketMaker:
             "offset=%.1f¢ size=%s refresh=%ss cooldown=%ss dryRun=%s",
             offsetCents, orderSize, refreshInterval, cooldownSeconds, dryRun,
         )
+        if baitEnabled:
+            logger.info("Bait layer: offset=%.1f¢ size=%s triggerRatio=%.2f poll=%ss",
+                        baitOffsetCents, baitSize, baitTriggerRatio, pollInterval)
         if offsetCents > self.market["rewardsMaxSpread"]:
             logger.warning("offset %.1f¢ > rewardsMaxSpread %.1f¢; orders will not earn rewards!",
                            offsetCents, self.market["rewardsMaxSpread"])
@@ -170,20 +184,59 @@ class PolymarketMaker:
 
         if dryRun:
             logger.info("=== DRY RUN: compute only, no orders; run once then exit ===")
-            self._tick()
+            self._quoteLayered() if baitEnabled else self._tick()
             return
 
         try:
-            while True:
-                try:
-                    self._tick()
-                except Exception as e:
-                    logger.error("tick error: %s", e)
-                time.sleep(refreshInterval)
+            if baitEnabled:
+                self._runLayered()
+            else:
+                self._runSimple()
         except KeyboardInterrupt:
             logger.info("Stopping, cancelling all orders...")
             self._cancelAll()
             logger.info("Done")
+
+    def _runSimple(self):
+        while True:
+            try:
+                self._tick()
+            except Exception as e:
+                logger.error("tick error: %s", e)
+            time.sleep(refreshInterval)
+
+    def _runLayered(self):
+        while True:
+            try:
+                tracked = self._quoteLayered()
+                if not tracked:
+                    time.sleep(pollInterval)
+                    continue
+                deadline = time.time() + refreshInterval
+                lastScoringCheck = time.time()
+                tripped = False
+                while time.time() < deadline:
+                    time.sleep(pollInterval)
+                    baitFilled, mainFilled = self._pollFills(tracked)
+                    if mainFilled > 0 or baitFilled >= baitTriggerRatio * baitSize:
+                        logger.info("Bait tripped: baitFilled=%.2f mainFilled=%.2f -> retreat",
+                                    baitFilled, mainFilled)
+                        playAlertSound()
+                        sendTelegram(f"⚡ Bait tripped ({marketMatch}): bait={baitFilled:.1f} "
+                                     f"main={mainFilled:.1f} shares — retreating")
+                        tripped = True
+                        break
+                    if scoringCheckInterval and time.time() - lastScoringCheck >= scoringCheckInterval:
+                        self._checkScoring(tracked)
+                        lastScoringCheck = time.time()
+                self._cancelAll()
+                self._flattenInventory()
+                if tripped:
+                    self.cooldownUntil = time.time() + cooldownSeconds
+                    logger.info("Entering cooldown %ds (main spread doubled)", cooldownSeconds)
+            except Exception as e:
+                logger.error("layered tick error: %s", e)
+                time.sleep(pollInterval)
 
     def _tick(self):
         if self._handleInventory():
@@ -228,8 +281,87 @@ class PolymarketMaker:
         logger.info("mid=%.4f | buy Yes @ %s | buy No @ %s | size=%s",
                     mid, bidYes, bidNo, orderSize)
 
-        self._placeBuy(self.market["yesToken"], bidYes, "Yes")
-        self._placeBuy(self.market["noToken"], bidNo, "No")
+        self._placeOrder(self.market["yesToken"], bidYes, orderSize, "Yes")
+        self._placeOrder(self.market["noToken"], bidNo, orderSize, "No")
+
+    def _quoteLayered(self) -> dict:
+        """Place main orders (reward-earning) plus small bait orders at the top of book.
+
+        Returns {orderId: {"kind": "main"/"bait", "size": float}} for fill tracking.
+        """
+        self._cancelAll()
+
+        mid = self._getMid()
+        if mid is None:
+            logger.warning("No valid midpoint; skipping this cycle")
+            return {}
+
+        effOffset = offsetCents
+        if time.time() < self.cooldownUntil:
+            effOffset = offsetCents * 2
+            logger.info("In cooldown, main spread doubled → %.1f¢", effOffset)
+        mainOff = effOffset / 100.0
+        baitOff = baitOffsetCents / 100.0
+
+        mainYes = self._clampPrice(mid - mainOff)
+        mainNo = self._clampPrice((1 - mid) - mainOff)
+        baitYes = self._clampPrice(mid - baitOff)
+        baitNo = self._clampPrice((1 - mid) - baitOff)
+        logger.info("mid=%.4f | main Yes@%s No@%s x%s | bait Yes@%s No@%s x%s",
+                    mid, mainYes, mainNo, orderSize, baitYes, baitNo, baitSize)
+
+        plan = [
+            (self.market["yesToken"], mainYes, orderSize, "main", "main Yes"),
+            (self.market["noToken"], mainNo, orderSize, "main", "main No"),
+            (self.market["yesToken"], baitYes, baitSize, "bait", "bait Yes"),
+            (self.market["noToken"], baitNo, baitSize, "bait", "bait No"),
+        ]
+        tracked = {}
+        for token, price, size, kind, label in plan:
+            oid = self._placeOrder(token, price, size, label)
+            if oid:
+                tracked[oid] = {"kind": kind, "size": size, "label": label}
+        return tracked
+
+    def _pollFills(self, tracked: dict):
+        """Return (baitFilledShares, mainFilledShares) across the tracked orders."""
+        from py_clob_client_v2 import OpenOrderParams
+
+        openOrders = self.client.get_open_orders(OpenOrderParams(market=self.market["conditionId"]))
+        matched = {o["id"]: float(o.get("size_matched", 0) or 0) for o in openOrders}
+
+        baitFilled = 0.0
+        mainFilled = 0.0
+        for oid, info in tracked.items():
+            filled = matched[oid] if oid in matched else info["size"]  # gone from book = fully filled
+            if info["kind"] == "bait":
+                baitFilled += filled
+            else:
+                mainFilled += filled
+        return baitFilled, mainFilled
+
+    def _flattenInventory(self):
+        for token, label in [(self.market["yesToken"], "Yes"), (self.market["noToken"], "No")]:
+            bal = self._getBalanceShares(token)
+            if bal > DUST_SHARES:
+                self._flatten(token, bal, label)
+
+    def _checkScoring(self, tracked: dict):
+        """Log whether the main orders are currently scoring (earning rewards)."""
+        from py_clob_client_v2 import OrdersScoringParams
+
+        mainIds = [oid for oid, info in tracked.items() if info["kind"] == "main"]
+        if not mainIds:
+            return
+        try:
+            result = self.client.are_orders_scoring(OrdersScoringParams(orderIds=mainIds))
+        except Exception as e:
+            logger.error("scoring check failed: %s", e)
+            return
+
+        scoring = sum(1 for oid in mainIds if result.get(oid))
+        parts = [f"{tracked[oid]['label']}={'✅' if result.get(oid) else '❌'}" for oid in mainIds]
+        logger.info("Reward scoring: %d/%d earning | %s", scoring, len(mainIds), " ".join(parts))
 
     def _getMid(self):
         resp = self.client.get_midpoint(self.market["yesToken"])
@@ -245,24 +377,26 @@ class PolymarketMaker:
             return (max(bids) + min(asks)) / 2
         return None
 
-    def _placeBuy(self, token: str, price: float, label: str):
+    def _placeOrder(self, token: str, price: float, size: float, label: str):
         if dryRun:
-            logger.info("[dryRun] skip placing buy %s @ %s x%s", label, price, orderSize)
-            return
+            logger.info("[dryRun] skip placing buy %s @ %s x%s", label, price, size)
+            return None
 
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
         try:
             order = self.client.create_order(
-                OrderArgs(token_id=token, price=price, size=orderSize, side=Side.BUY),
+                OrderArgs(token_id=token, price=price, size=size, side=Side.BUY),
                 options=PartialCreateOrderOptions(tick_size=str(self.tickSize), neg_risk=True),
             )
             resp = self.client.post_order(order, OrderType.GTC, True)
             oid = resp.get("orderID") if isinstance(resp, dict) else None
-            logger.info("Placed buy %s @ %s x%s → %s", label, price, orderSize, oid or resp)
-            self._logCsv("place", label, price, orderSize, str(oid or resp))
+            logger.info("Placed buy %s @ %s x%s → %s", label, price, size, oid or resp)
+            self._logCsv("place", label, price, size, str(oid or resp))
+            return oid
         except Exception as e:
             logger.error("Failed to place buy %s @ %s: %s", label, price, e)
+            return None
 
     def _flatten(self, token: str, shares: float, label: str):
         # Floor to the 2-decimal size precision so we never try to sell more than we hold
