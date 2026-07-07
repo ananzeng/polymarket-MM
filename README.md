@@ -57,6 +57,7 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 ```
 ├── lp_maker.py          # LP 動態掛單機器人（主程式）
 ├── notifier.py          # Telegram 成交/平倉通知
+├── pnl.py               # 從成交+獎勵算 PnL 並畫 3 條折線（log/pnl.png）
 ├── polymarket_data.py   # Polymarket Gamma / CLOB API 資料抓取
 ├── approve.py           # 一次性：approve USDC + CTF 給 Polymarket 合約
 ├── test_order.py        # 下單環境測試腳本
@@ -84,6 +85,9 @@ venv/bin/python lp_maker.py
 
 # 3. 實跑（.env 設 DRY_RUN=false）：開始動態雙邊掛單，Ctrl+C 停止並清空掛單
 venv/bin/python lp_maker.py
+
+# 4. 查 PnL：從成交+獎勵算交易 PnL / LP 獎勵 / 總和，畫成 log/pnl.png
+venv/bin/python pnl.py
 ```
 
 ## Proxy（必要）
