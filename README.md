@@ -42,6 +42,7 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 | `BAIT_TRIGGER_RATIO` | `0.5` | 誘餌被吃到此比例（或主單被吃）就撤主單、平倉、冷卻 |
 | `POLL_INTERVAL` | `1.0` | 分層模式下查各單成交量的間隔（秒） |
 | `SCORING_CHECK_INTERVAL` | `20` | 每隔幾秒查主單是否正在計分（賺獎勵）並 log，`0` 關閉 |
+| `DASHBOARD_PORT` | `8000` | dashboard.py 網頁埠號（http://localhost:8000） |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | 成交/平倉時發 Telegram 通知，留空則不通知 |
 | `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_FUNDER` / `POLYMARKET_PROXY` | — | 錢包與代理設定 |
 
@@ -56,7 +57,9 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 
 ```
 ├── lp_maker.py          # LP 動態掛單機器人（主程式）
+├── dashboard.py         # 網頁儀表板：跑 bot + 即時 PnL/獎勵速率/計分 + Start/Stop
 ├── notifier.py          # Telegram 成交/平倉通知
+├── market_info.py       # 貼網址 → 輸出 .env 的 MARKET_SLUG/MARKET_MATCH 並檢查獎勵
 ├── pnl.py               # 從成交+獎勵算 PnL 並畫 3 條折線（log/pnl.png）
 ├── polymarket_data.py   # Polymarket Gamma / CLOB API 資料抓取
 ├── approve.py           # 一次性：approve USDC + CTF 給 Polymarket 合約
@@ -77,6 +80,9 @@ venv/bin/python approve.py
 ## 使用
 
 ```bash
+# 0. 換市場：貼 Polymarket 網址 → 得到 .env 的 MARKET_SLUG/MARKET_MATCH 並確認有獎勵
+venv/bin/python market_info.py "https://polymarket.com/event/.../..."
+
 # 1. 環境檢查（ClobClient 初始化 + 餘額 / allowance）
 venv/bin/python test_order.py
 
@@ -88,6 +94,10 @@ venv/bin/python lp_maker.py
 
 # 4. 查 PnL：從成交+獎勵算交易 PnL / LP 獎勵 / 總和，畫成 log/pnl.png
 venv/bin/python pnl.py
+
+# 5. 儀表板（建議）：一個指令同時跑 bot + 網頁，瀏覽器開 http://localhost:8000
+#    即時顯示獎勵速率($/5min，市場 CP)、今日 PnL、計分狀態，附 Start/Stop 按鈕
+venv/bin/python dashboard.py
 ```
 
 ## Proxy（必要）

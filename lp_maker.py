@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -164,6 +165,12 @@ class PolymarketMaker:
         self.tickSize = market["tickSize"]
         self.priceDecimals = max(0, len(f"{self.tickSize:.10f}".rstrip("0").split(".")[1]))
         self.cooldownUntil = 0.0
+        # Set by the dashboard to stop the loop; live status attrs below are read by it.
+        self.stopEvent = threading.Event()
+        self.lastMid = None
+        self.lastQuotes = {}
+        self.lastScoring = {}
+        self.lastScoringTs = 0.0
 
     def run(self):
         logger.info("Target market: %s", self.market["question"])
@@ -198,25 +205,26 @@ class PolymarketMaker:
             logger.info("Done")
 
     def _runSimple(self):
-        while True:
+        while not self.stopEvent.is_set():
             try:
                 self._tick()
             except Exception as e:
                 logger.error("tick error: %s", e)
-            time.sleep(refreshInterval)
+            self.stopEvent.wait(refreshInterval)
 
     def _runLayered(self):
-        while True:
+        while not self.stopEvent.is_set():
             try:
                 tracked = self._quoteLayered()
                 if not tracked:
-                    time.sleep(pollInterval)
+                    self.stopEvent.wait(pollInterval)
                     continue
                 deadline = time.time() + refreshInterval
                 lastScoringCheck = time.time()
                 tripped = False
                 while time.time() < deadline:
-                    time.sleep(pollInterval)
+                    if self.stopEvent.wait(pollInterval):
+                        break
                     baitFilled, mainFilled = self._pollFills(tracked)
                     if mainFilled > 0 or baitFilled >= baitTriggerRatio * baitSize:
                         logger.info("Bait tripped: baitFilled=%.2f mainFilled=%.2f -> retreat",
@@ -236,7 +244,7 @@ class PolymarketMaker:
                     logger.info("Entering cooldown %ds (main spread doubled)", cooldownSeconds)
             except Exception as e:
                 logger.error("layered tick error: %s", e)
-                time.sleep(pollInterval)
+                self.stopEvent.wait(pollInterval)
 
     def _tick(self):
         if self._handleInventory():
@@ -280,6 +288,8 @@ class PolymarketMaker:
         bidNo = self._clampPrice((1 - mid) - offset)
         logger.info("mid=%.4f | buy Yes @ %s | buy No @ %s | size=%s",
                     mid, bidYes, bidNo, orderSize)
+        self.lastMid = mid
+        self.lastQuotes = {"main Yes": bidYes, "main No": bidNo}
 
         self._placeOrder(self.market["yesToken"], bidYes, orderSize, "Yes")
         self._placeOrder(self.market["noToken"], bidNo, orderSize, "No")
@@ -309,6 +319,9 @@ class PolymarketMaker:
         baitNo = self._clampPrice((1 - mid) - baitOff)
         logger.info("mid=%.4f | main Yes@%s No@%s x%s | bait Yes@%s No@%s x%s",
                     mid, mainYes, mainNo, orderSize, baitYes, baitNo, baitSize)
+        self.lastMid = mid
+        self.lastQuotes = {"main Yes": mainYes, "main No": mainNo,
+                           "bait Yes": baitYes, "bait No": baitNo}
 
         plan = [
             (self.market["yesToken"], mainYes, orderSize, "main", "main Yes"),
@@ -362,6 +375,8 @@ class PolymarketMaker:
         scoring = sum(1 for oid in mainIds if result.get(oid))
         parts = [f"{tracked[oid]['label']}={'✅' if result.get(oid) else '❌'}" for oid in mainIds]
         logger.info("Reward scoring: %d/%d earning | %s", scoring, len(mainIds), " ".join(parts))
+        self.lastScoring = {tracked[oid]["label"]: bool(result.get(oid)) for oid in mainIds}
+        self.lastScoringTs = time.time()
 
     def _getMid(self):
         resp = self.client.get_midpoint(self.market["yesToken"])
