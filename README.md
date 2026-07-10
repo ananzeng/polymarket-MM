@@ -43,6 +43,8 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 | `POLL_INTERVAL` | `1.0` | 分層模式下查各單成交量的間隔（秒） |
 | `SCORING_CHECK_INTERVAL` | `20` | 每隔幾秒查主單是否正在計分（賺獎勵）並 log，`0` 關閉 |
 | `DASHBOARD_PORT` | `8000` | dashboard.py 網頁埠號（http://localhost:8000） |
+| `REWARD_RATE_LOG_INTERVAL` | `300` | 每隔幾秒把 reward rate 快照寫進 `log/reward_rate.csv`（預設 5 分鐘） |
+| `CHART_WINDOW_HOURS` | `12` | 網頁圖表顯示的滾動時間視窗（小時） |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | 成交/平倉時發 Telegram 通知，留空則不通知 |
 | `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_FUNDER` / `POLYMARKET_PROXY` | — | 錢包與代理設定 |
 

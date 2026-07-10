@@ -5,6 +5,7 @@ and order scoring, with Start/Stop control.
 Run: venv/bin/python dashboard.py    then open http://localhost:8000
 Ctrl+C stops the bot, cancels all orders, and flattens inventory.
 """
+import csv
 import json
 import logging
 import os
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 STATS_INTERVAL = 12          # seconds between stats collections
 RATE_WINDOW = 900            # sliding window (s) for the reward-rate measurement
+RATE_LOG_INTERVAL = int(os.getenv("REWARD_RATE_LOG_INTERVAL", "300"))  # snapshot cadence (s)
+RATE_LOG_CSV = "reward_rate.csv"
+CHART_WINDOW_HOURS = int(os.getenv("CHART_WINDOW_HOURS", "12"))  # rolling time window shown on charts
+RECENT_FILLS_LIMIT = 20
+SAMPLES_MAXLEN = int(CHART_WINDOW_HOURS * 3600 / STATS_INTERVAL) + 50
 
 
 class BotManager:
@@ -62,8 +68,12 @@ class Stats:
         self.bot = bot
         self.funder = os.environ["POLYMARKET_FUNDER"].lower()
         self.rewardHist = deque(maxlen=600)   # (ts, cumRewardToday)
-        self.samples = deque(maxlen=2000)     # (ts, rewardToday, tradingToday, net) for the chart
+        self.samples = deque(maxlen=SAMPLES_MAXLEN)  # (ts, rewardToday, tradingToday, net) for the chart
+        self.rateLogPath = os.path.join(lm.logDir, RATE_LOG_CSV)
+        self.rateSnapshots = deque(maxlen=2000)  # (ts, per5min, perHour, perDay) for the rate chart
+        self.lastRateLogTs = 0.0
         self.snapshot = {}
+        self._loadTodayRateSnapshots()
 
     def loop(self):
         while True:
@@ -78,6 +88,36 @@ class Stats:
         rows = self.bot.client.get_total_earnings_for_user_for_day(d)
         return sum(float(r.get("earnings", 0) or 0) for r in rows) if rows else 0.0
 
+    def _loadTodayRateSnapshots(self):
+        """Preload today's snapshots so the rate chart survives a dashboard restart."""
+        if not os.path.exists(self.rateLogPath):
+            return
+        todayStr = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with open(self.rateLogPath, newline="") as f:
+            for row in csv.DictReader(f):
+                if not row.get("time", "").startswith(todayStr):
+                    continue
+                try:
+                    self.rateSnapshots.append((
+                        float(row["epoch"]), float(row["per5min"]),
+                        float(row["perHour"]), float(row["perDay"]),
+                    ))
+                except (KeyError, ValueError):
+                    continue
+
+    def _logRateSnapshot(self, ts: float, per5min: float, perHour: float, perDay: float):
+        os.makedirs(lm.logDir, exist_ok=True)
+        newFile = not os.path.exists(self.rateLogPath)
+        with open(self.rateLogPath, "a", newline="") as f:
+            writer = csv.writer(f)
+            if newFile:
+                writer.writerow(["time", "epoch", "market", "per5min", "perHour", "perDay"])
+            writer.writerow([
+                datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat(),
+                ts, self.bot.market["question"], per5min, perHour, perDay,
+            ])
+        self.rateSnapshots.append((ts, per5min, perHour, perDay))
+
     def _collect(self):
         now = time.time()
         nowUtc = datetime.now(timezone.utc)
@@ -87,6 +127,11 @@ class Stats:
         base = next((s for s in self.rewardHist if s[0] >= now - RATE_WINDOW), self.rewardHist[0])
         dt = now - base[0]
         ratePerSec = (reward - base[1]) / dt if dt >= 30 else 0.0
+        per5min, perHour, perDay = ratePerSec * 300, ratePerSec * 3600, ratePerSec * 86400
+
+        if now - self.lastRateLogTs >= RATE_LOG_INTERVAL:
+            self._logRateSnapshot(now, round(per5min, 4), round(perHour, 4), round(perDay, 2))
+            self.lastRateLogTs = now
 
         trades = self.bot.client.get_trades(TradeParams(market=self.bot.market["conditionId"]))
         fills = userFills(trades, self.funder)
@@ -104,6 +149,12 @@ class Stats:
             else:
                 cashAll += px * sz
                 pos[oc] -= sz
+        recentFills = [
+            {"time": datetime.fromtimestamp(ts, lm.TZ_UTC8).strftime("%m-%d %H:%M:%S"),
+             "outcome": oc, "side": side, "size": round(sz, 2), "price": px}
+            for ts, oc, side, sz, px in reversed(fills[-RECENT_FILLS_LIMIT:])
+        ]
+
         mid = (self.bot.maker.lastMid if self.bot.maker and self.bot.maker.lastMid else 0.5)
         tradingAll = cashAll + pos["Yes"] * mid + pos["No"] * (1 - mid)
 
@@ -127,9 +178,9 @@ class Stats:
             },
             "rewards": {
                 "today": round(reward, 4),
-                "per5min": round(ratePerSec * 300, 4),
-                "perHour": round(ratePerSec * 3600, 4),
-                "perDay": round(ratePerSec * 86400, 2),
+                "per5min": round(per5min, 4),
+                "perHour": round(perHour, 4),
+                "perDay": round(perDay, 2),
                 "windowSec": round(dt),
             },
             "pnl": {
@@ -141,6 +192,8 @@ class Stats:
                 "netCpPerDay": round((net / elapsedH * 24) / lm.orderSize * 100, 2),
             },
             "history": [list(s) for s in self.samples],
+            "rateHistory": [list(s) for s in self.rateSnapshots],
+            "recentFills": recentFills,
         }
 
 
@@ -160,9 +213,15 @@ button.stop{background:#c0392b} button:disabled{opacity:.4;cursor:default}
 .big{font-size:22px;font-weight:600}.sub{font-size:12px;color:#8a93a2;margin-top:4px}
 .pos{color:#3ddc84}.neg{color:#ff5d5d}
 table{border-collapse:collapse;font-size:13px}td{padding:2px 10px 2px 0;color:#c9d1dc}
-#chart{width:100%;height:260px;background:#1a212b;border-radius:10px;margin-top:12px}
+#chart,#rateChart{width:100%;height:260px;background:#1a212b;border-radius:10px;margin-top:12px}
 .legend{font-size:12px;color:#8a93a2;margin-top:6px}
 .legend span{margin-right:16px}
+h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
+.fillsBox{background:#1a212b;border-radius:10px;padding:6px 14px;margin-top:12px;max-height:260px;overflow-y:auto}
+.fillsBox table{width:100%}
+.fillsBox th{text-align:left;color:#6b7482;font-weight:500;font-size:11px;padding:6px 10px 6px 0;position:sticky;top:0;background:#1a212b}
+.fillsBox td{padding:4px 10px 4px 0}
+.buy{color:#2E86DE}.sell{color:#3ddc84}
 </style></head><body>
 <h1>polymarket-MM dashboard</h1><div id=market>loading…</div>
 <div class=bar>
@@ -179,9 +238,17 @@ table{border-collapse:collapse;font-size:13px}td{padding:2px 10px 2px 0;color:#c
 <div class=card><h2>Quotes</h2><table id=quotes></table><div class=sub id=mid></div></div>
 <div class=card><h2>Scoring (earning?)</h2><div id=scoring class=big style="font-size:16px">–</div><div class=sub id=sage></div></div>
 </div>
+<h3>Recent fills (from Polymarket trade records)</h3>
+<div class=fillsBox><table><thead><tr><th>Time</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th></tr></thead>
+<tbody id=fillsBody></tbody></table></div>
+<h3>PnL over time (last __CHART_WINDOW_H__h)</h3>
 <canvas id=chart></canvas>
 <div class=legend><span style="color:#3ddc84">■ rewards</span><span style="color:#2E86DE">■ trading</span><span style="color:#b07cd8">■ net</span></div>
+<h3>Reward rate over time (last __CHART_WINDOW_H__h, $/5min, snapshot every 5min)</h3>
+<canvas id=rateChart></canvas>
+<div class=legend><span style="color:#f0a63a">■ $/5min</span></div>
 <script>
+const CHART_WINDOW_H = __CHART_WINDOW_H__;
 async function ctl(a){await fetch('/api/'+a,{method:'POST'});setTimeout(refresh,600)}
 function fmt(x,d=4){return (x>=0?'+':'')+x.toFixed(d)}
 function cls(el,x){el.className='big '+(x>=0?'pos':'neg')}
@@ -213,24 +280,52 @@ async function refresh(){
  const ent=Object.entries(s.bot.scoring);
  sc.textContent=ent.length?ent.map(([k,v])=>k+' '+(v?'✅':'❌')).join('  '):'–';
  document.getElementById('sage').textContent=s.bot.scoringAge!=null?('checked '+s.bot.scoringAge+'s ago'):'';
- draw(s.history);
+ const fb=document.getElementById('fillsBody');
+ fb.innerHTML=(s.recentFills&&s.recentFills.length)?s.recentFills.map(f=>
+   '<tr><td>'+f.time+'</td><td>'+f.outcome+'</td><td class="'+(f.side==='BUY'?'buy':'sell')+'">'+f.side+'</td>'
+   +'<td>'+f.size+'</td><td>'+f.price+'</td><td>$'+(f.size*f.price).toFixed(2)+'</td></tr>'
+ ).join(''):'<tr><td colspan=6 style="color:#6b7482">No fills yet</td></tr>';
+ renderChart('chart', s.history, [{idx:3,color:'#b07cd8',w:2.4},{idx:2,color:'#2E86DE',w:1.4},{idx:1,color:'#3ddc84',w:1.4}]);
+ renderChart('rateChart', s.rateHistory, [{idx:1,color:'#f0a63a',w:1.8}]);
 }
-function draw(h){
- const cv=document.getElementById('chart');const W=cv.width=cv.clientWidth;const H=cv.height=260;
+function fmtTime(ts){return new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+function fmtMoney(v){return (v>=0?'$':'-$')+Math.abs(v).toFixed(2)}
+function renderChart(id, hist, series){
+ const cv=document.getElementById(id);const W=cv.width=cv.clientWidth;const H=cv.height=260;
  const g=cv.getContext('2d');g.clearRect(0,0,W,H);
- if(!h||h.length<2)return;
- const t0=h[0][0],t1=h[h.length-1][0];
- let vals=[];h.forEach(s=>{vals.push(s[1],s[2],s[3])});
- let lo=Math.min(...vals,0),hi=Math.max(...vals,0);if(hi-lo<1e-6){hi=lo+1}
- const X=t=>(t-t0)/(t1-t0||1)*(W-20)+10;
- const Y=v=>H-14-(v-lo)/(hi-lo)*(H-28);
- g.strokeStyle='#3a4454';g.beginPath();g.moveTo(10,Y(0));g.lineTo(W-10,Y(0));g.stroke();
- const line=(idx,color,w)=>{g.strokeStyle=color;g.lineWidth=w;g.beginPath();
-  h.forEach((s,i)=>{i?g.lineTo(X(s[0]),Y(s[idx])):g.moveTo(X(s[0]),Y(s[idx]))});g.stroke()};
- line(3,'#b07cd8',2.4);line(2,'#2E86DE',1.4);line(1,'#3ddc84',1.4);g.lineWidth=1;
+ const L=52,R=10,T=10,B=22;
+ const t1=Date.now()/1000, t0=t1-CHART_WINDOW_H*3600;
+ const pts=(hist||[]).filter(s=>s[0]>=t0);
+ g.font='11px -apple-system,sans-serif';
+ if(!pts.length){
+   g.fillStyle='#6b7482';g.fillText('No data in the last '+CHART_WINDOW_H+'h yet', L, H/2);
+   return;
+ }
+ let vals=[0];pts.forEach(s=>series.forEach(sr=>vals.push(s[sr.idx])));
+ let lo=Math.min(...vals),hi=Math.max(...vals);if(hi-lo<1e-6){hi=lo+1}
+ const X=t=>L+(t-t0)/(t1-t0)*(W-L-R);
+ const Y=v=>H-B-(v-lo)/(hi-lo)*(H-T-B);
+ for(let i=0;i<=4;i++){
+   const v=lo+(hi-lo)*i/4, y=Y(v);
+   g.strokeStyle='#232a35';g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();
+   g.fillStyle='#6b7482';g.fillText(fmtMoney(v),2,y+3);
+ }
+ for(let i=0;i<=6;i++){
+   const t=t0+(t1-t0)*i/6, x=X(t);
+   g.strokeStyle='#1e242d';g.beginPath();g.moveTo(x,T);g.lineTo(x,H-B);g.stroke();
+   g.fillStyle='#6b7482';g.fillText(fmtTime(t),Math.min(Math.max(x-18,L),W-R-34),H-6);
+ }
+ if(lo<0&&hi>0){g.strokeStyle='#3a4454';g.beginPath();g.moveTo(L,Y(0));g.lineTo(W-R,Y(0));g.stroke();}
+ series.forEach(sr=>{
+   g.strokeStyle=sr.color;g.lineWidth=sr.w||1.5;g.beginPath();
+   pts.forEach((s,i)=>{i?g.lineTo(X(s[0]),Y(s[sr.idx])):g.moveTo(X(s[0]),Y(s[sr.idx]))});
+   g.stroke();
+ });
 }
 setInterval(refresh,3000);refresh();
 </script></body></html>"""
+
+PAGE = PAGE.replace("__CHART_WINDOW_H__", str(CHART_WINDOW_HOURS))
 
 
 def makeHandler(bot: BotManager, stats: Stats):
