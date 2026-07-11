@@ -3,6 +3,7 @@ Fetch Polymarket "Bitcoin above ___ on [date]?" market data.
 
 Settlement rule: if the Binance BTC/USDT 1-minute candle close at noon ET is >= $X, Yes wins.
 """
+import json
 import re
 import time
 import logging
@@ -48,6 +49,16 @@ def fetchEventBySlug(slug: str) -> Optional[dict]:
         return None
 
 
+def parseJsonList(value) -> list:
+    """Gamma returns list fields as JSON strings; normalize to a real list."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return []
+    return value or []
+
+
 def parseEventMarkets(event: dict) -> list:
     """
     Parse all markets of an event.
@@ -62,26 +73,14 @@ def parseEventMarkets(event: dict) -> list:
         clobYesTokenId, clobNoTokenId,
     }
     """
-    import json
     results = []
     for m in event.get("markets", []):
         targetPrice = parseTargetPrice(m.get("question", ""))
         if targetPrice is None:
             continue
 
-        outcomePrices = m.get("outcomePrices", [])
-        if isinstance(outcomePrices, str):
-            try:
-                outcomePrices = json.loads(outcomePrices)
-            except Exception:
-                outcomePrices = []
-
-        clobTokenIds = m.get("clobTokenIds", [])
-        if isinstance(clobTokenIds, str):
-            try:
-                clobTokenIds = json.loads(clobTokenIds)
-            except Exception:
-                clobTokenIds = []
+        outcomePrices = parseJsonList(m.get("outcomePrices"))
+        clobTokenIds = parseJsonList(m.get("clobTokenIds"))
 
         outcomesYesPrice = float(outcomePrices[0]) if len(outcomePrices) > 0 else None
         outcomesNoPrice = float(outcomePrices[1]) if len(outcomePrices) > 1 else None
@@ -184,33 +183,6 @@ def getPriceAtTime(history: list, targetDt: datetime) -> Optional[float]:
     return result
 
 
-def enrichMarketsWithClobPrices(
-    markets: list,
-    signalDt: datetime,
-    delaySeconds: float = 0.2,
-) -> list:
-    """
-    For each market, backfill the price at signalDt using CLOB prices-history.
-
-    Adds key:
-        clobYesPriceAtSignal  - the Yes price at bet time (for backtesting)
-
-    Only settled (closed=True) markets need backfilling; in-progress ones can use lastTradePrice.
-    """
-    enriched = []
-    for m in markets:
-        if not m.get("closed") or m.get("clobYesTokenId") is None:
-            enriched.append({**m, "clobYesPriceAtSignal": None})
-            continue
-
-        history = fetchClobPriceHistory(m["clobYesTokenId"])
-        priceAtSignal = getPriceAtTime(history, signalDt)
-        enriched.append({**m, "clobYesPriceAtSignal": priceAtSignal})
-        time.sleep(delaySeconds)
-
-    return enriched
-
-
 def fetchAllClobHistories(
     markets: list,
     delaySeconds: float = 0.2,
@@ -279,7 +251,6 @@ def fetchHistoricalAboveEvents(
 
 
 if __name__ == "__main__":
-    import logging
     logging.basicConfig(level=logging.WARNING)
 
     event = fetchDailyAboveEvent(date.today())

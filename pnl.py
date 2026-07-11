@@ -10,13 +10,8 @@ Run: venv/bin/python pnl.py
 import os
 from datetime import datetime, timezone, timedelta
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-
-from lp_maker import initClobClient, resolveMarket, logDir
-from py_clob_client_v2 import TradeParams, BalanceAllowanceParams, AssetType
+from lp_maker import initClobClient, resolveMarket, getFunder, parseFloat, logDir
+from py_clob_client_v2 import TradeParams
 
 UTC = timezone.utc
 
@@ -41,6 +36,35 @@ def userFills(trades: list, funder: str) -> list:
                                   float(mo["matched_amount"]), float(mo["price"])))
     fills.sort()
     return fills
+
+
+def fillsToCashAndPos(fills: list) -> tuple:
+    """Aggregate fills into (net cash flow, per-outcome position)."""
+    cash = 0.0
+    pos = {"Yes": 0.0, "No": 0.0}
+    for _, oc, side, sz, px in fills:
+        if side == "BUY":
+            cash -= px * sz
+            pos[oc] += sz
+        else:
+            cash += px * sz
+            pos[oc] -= sz
+    return cash, pos
+
+
+def rewardForDay(client, dayStr: str) -> float:
+    """Total LP-reward earnings for one UTC day (YYYY-MM-DD)."""
+    rows = client.get_total_earnings_for_user_for_day(dayStr)
+    return sum(float(r.get("earnings", 0) or 0) for r in rows) if rows else 0.0
+
+
+def dayStartUtc(now: datetime) -> float:
+    return datetime(now.year, now.month, now.day, tzinfo=UTC).timestamp()
+
+
+def netCpPerDay(net: float, elapsedHours: float, capital: float) -> float:
+    """Projected daily yield (%) on the deployed capital."""
+    return net / elapsedHours * 24 / capital * 100
 
 
 def tradingSeries(fills: list, marks: dict):
@@ -70,8 +94,7 @@ def rewardSeries(client, firstDate, today):
     cum = 0.0
     d = firstDate
     while d <= today:
-        rows = client.get_total_earnings_for_user_for_day(d.strftime("%Y-%m-%d"))
-        cum += sum(float(r.get("earnings", 0) or 0) for r in rows) if rows else 0.0
+        cum += rewardForDay(client, d.strftime("%Y-%m-%d"))
         endTs = (datetime(d.year, d.month, d.day, tzinfo=UTC) + timedelta(days=1)
                  if d < today else datetime.now(UTC))
         times.append(endTs)
@@ -93,9 +116,14 @@ def ffill(times, vals, queries):
 
 
 def main():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
     market = resolveMarket()
     client = initClobClient()
-    funder = os.environ["POLYMARKET_FUNDER"].lower()
+    funder = getFunder()
 
     trades = client.get_trades(TradeParams(market=market["conditionId"]))
     fills = userFills(trades, funder)
@@ -104,8 +132,7 @@ def main():
         return
 
     def mid(token):
-        resp = client.get_midpoint(token)
-        return float(resp["mid"]) if isinstance(resp, dict) and resp.get("mid") else 0.5
+        return parseFloat(client.get_midpoint(token), "mid") or 0.5
 
     marks = {"Yes": mid(market["yesToken"]), "No": mid(market["noToken"])}
 

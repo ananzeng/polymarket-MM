@@ -16,8 +16,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import lp_maker as lm
-from pnl import userFills
-from py_clob_client_v2 import TradeParams
+from pnl import userFills, fillsToCashAndPos, rewardForDay, dayStartUtc, netCpPerDay
+from py_clob_client_v2 import TradeParams, AssetType
 
 logger = logging.getLogger(__name__)
 
@@ -58,21 +58,21 @@ class BotManager:
             self.maker.stopEvent.set()
             if self.thread:
                 self.thread.join(timeout=lm.pollInterval + 15)
-            self.maker._cancelAll()
-            self.maker._flattenInventory()
+            self.maker.shutdown()
             logger.info("Bot stopped, orders cancelled")
 
 
 class Stats:
     def __init__(self, bot: BotManager):
         self.bot = bot
-        self.funder = os.environ["POLYMARKET_FUNDER"].lower()
+        self.funder = lm.getFunder()
         self.rewardHist = deque(maxlen=600)   # (ts, cumRewardToday)
-        self.samples = deque(maxlen=SAMPLES_MAXLEN)  # (ts, rewardToday, tradingToday, net) for the chart
+        self.samples = deque(maxlen=SAMPLES_MAXLEN)  # (ts, rewardToday, accountValue) for the chart
         self.rateLogPath = os.path.join(lm.logDir, RATE_LOG_CSV)
         self.rateSnapshots = deque(maxlen=2000)  # (ts, per5min, perHour, perDay) for the rate chart
         self.lastRateLogTs = 0.0
         self.snapshot = {}
+        self.snapshotJson = "{}"
         self._loadTodayRateSnapshots()
 
     def loop(self):
@@ -83,10 +83,12 @@ class Stats:
                 logger.error("stats error: %s", e)
             time.sleep(STATS_INTERVAL)
 
-    def _rewardToday(self) -> float:
-        d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        rows = self.bot.client.get_total_earnings_for_user_for_day(d)
-        return sum(float(r.get("earnings", 0) or 0) for r in rows) if rows else 0.0
+    def _accountValue(self, mid: float) -> float:
+        """USDC balance plus this market's Yes/No holdings valued at mid."""
+        usdc = lm.getBalanceShares(self.bot.client, assetType=AssetType.COLLATERAL)
+        yesBal = lm.getBalanceShares(self.bot.client, self.bot.market["yesToken"])
+        noBal = lm.getBalanceShares(self.bot.client, self.bot.market["noToken"])
+        return usdc + yesBal * mid + noBal * (1 - mid)
 
     def _loadTodayRateSnapshots(self):
         """Preload today's snapshots so the rate chart survives a dashboard restart."""
@@ -106,23 +108,17 @@ class Stats:
                     continue
 
     def _logRateSnapshot(self, ts: float, per5min: float, perHour: float, perDay: float):
-        os.makedirs(lm.logDir, exist_ok=True)
-        newFile = not os.path.exists(self.rateLogPath)
-        with open(self.rateLogPath, "a", newline="") as f:
-            writer = csv.writer(f)
-            if newFile:
-                writer.writerow(["time", "epoch", "market", "per5min", "perHour", "perDay"])
-            writer.writerow([
-                datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat(),
-                ts, self.bot.market["question"], per5min, perHour, perDay,
-            ])
+        lm.appendCsvRow(self.rateLogPath,
+                        ["time", "epoch", "market", "per5min", "perHour", "perDay"],
+                        [datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat(),
+                         ts, self.bot.market["question"], per5min, perHour, perDay])
         self.rateSnapshots.append((ts, per5min, perHour, perDay))
 
     def _collect(self):
         now = time.time()
         nowUtc = datetime.now(timezone.utc)
 
-        reward = self._rewardToday()
+        reward = rewardForDay(self.bot.client, nowUtc.strftime("%Y-%m-%d"))
         self.rewardHist.append((now, reward))
         base = next((s for s in self.rewardHist if s[0] >= now - RATE_WINDOW), self.rewardHist[0])
         dt = now - base[0]
@@ -135,31 +131,28 @@ class Stats:
 
         trades = self.bot.client.get_trades(TradeParams(market=self.bot.market["conditionId"]))
         fills = userFills(trades, self.funder)
-        dayStart = datetime(nowUtc.year, nowUtc.month, nowUtc.day, tzinfo=timezone.utc).timestamp()
+        dayStart = dayStartUtc(nowUtc)
         todayFills = [f for f in fills if f[0] >= dayStart]
-        tradingToday = sum((px * sz if side == "SELL" else -px * sz)
-                           for _, oc, side, sz, px in todayFills)
 
-        pos = {"Yes": 0.0, "No": 0.0}
-        cashAll = 0.0
-        for _, oc, side, sz, px in fills:
-            if side == "BUY":
-                cashAll -= px * sz
-                pos[oc] += sz
-            else:
-                cashAll += px * sz
-                pos[oc] -= sz
+        mid = (self.bot.maker.lastMid if self.bot.maker and self.bot.maker.lastMid else 0.5)
+
+        # Mark-to-market any position still open at this instant (e.g. sampled between a fill
+        # and its automatic flatten a few seconds later) instead of valuing it at zero.
+        cashToday, posToday = fillsToCashAndPos(todayFills)
+        tradingToday = cashToday + posToday["Yes"] * mid + posToday["No"] * (1 - mid)
+
+        cashAll, pos = fillsToCashAndPos(fills)
         recentFills = [
             {"time": datetime.fromtimestamp(ts, lm.TZ_UTC8).strftime("%m-%d %H:%M:%S"),
              "outcome": oc, "side": side, "size": round(sz, 2), "price": px}
             for ts, oc, side, sz, px in reversed(fills[-RECENT_FILLS_LIMIT:])
         ]
 
-        mid = (self.bot.maker.lastMid if self.bot.maker and self.bot.maker.lastMid else 0.5)
         tradingAll = cashAll + pos["Yes"] * mid + pos["No"] * (1 - mid)
+        accountValue = self._accountValue(mid)
 
         net = reward + tradingToday
-        self.samples.append((now, round(reward, 4), round(tradingToday, 4), round(net, 4)))
+        self.samples.append((now, round(reward, 4), round(accountValue, 4)))
 
         maker = self.bot.maker
         elapsedH = max((now - dayStart) / 3600, 0.1)
@@ -189,12 +182,15 @@ class Stats:
                 "fillsToday": len(todayFills),
                 "tradingAllTime": round(tradingAll, 4),
                 "capital": lm.orderSize,
-                "netCpPerDay": round((net / elapsedH * 24) / lm.orderSize * 100, 2),
+                "netCpPerDay": round(netCpPerDay(net, elapsedH, lm.orderSize), 2),
+                "accountValue": round(accountValue, 2),
             },
             "history": [list(s) for s in self.samples],
             "rateHistory": [list(s) for s in self.rateSnapshots],
             "recentFills": recentFills,
         }
+        # Serialize once per collection; /api/stats polls faster than the data changes.
+        self.snapshotJson = json.dumps(self.snapshot)
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>polymarket-MM</title>
@@ -213,7 +209,9 @@ button.stop{background:#c0392b} button:disabled{opacity:.4;cursor:default}
 .big{font-size:22px;font-weight:600}.sub{font-size:12px;color:#8a93a2;margin-top:4px}
 .pos{color:#3ddc84}.neg{color:#ff5d5d}
 table{border-collapse:collapse;font-size:13px}td{padding:2px 10px 2px 0;color:#c9d1dc}
-#chart,#rateChart{width:100%;height:260px;background:#1a212b;border-radius:10px;margin-top:12px}
+#chart,#rewardChart,#rateChart{width:100%;height:260px;background:#1a212b;border-radius:10px;margin-top:12px;cursor:crosshair}
+.chartRow{display:flex;gap:12px}
+.chartCol{flex:1;min-width:0}
 .legend{font-size:12px;color:#8a93a2;margin-top:6px}
 .legend span{margin-right:16px}
 h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
@@ -241,9 +239,11 @@ h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
 <h3>Recent fills (from Polymarket trade records)</h3>
 <div class=fillsBox><table><thead><tr><th>Time</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th></tr></thead>
 <tbody id=fillsBody></tbody></table></div>
-<h3>PnL over time (last __CHART_WINDOW_H__h)</h3>
-<canvas id=chart></canvas>
-<div class=legend><span style="color:#3ddc84">■ rewards</span><span style="color:#2E86DE">■ trading</span><span style="color:#b07cd8">■ net</span></div>
+<h3>Account value &amp; rewards (last __CHART_WINDOW_H__h)</h3>
+<div class=chartRow>
+<div class=chartCol><canvas id=chart></canvas><div class=legend><span style="color:#2E86DE">■ account value</span></div></div>
+<div class=chartCol><canvas id=rewardChart></canvas><div class=legend><span style="color:#3ddc84">■ rewards</span></div></div>
+</div>
 <h3>Reward rate over time (last __CHART_WINDOW_H__h, $/5min, snapshot every 5min)</h3>
 <canvas id=rateChart></canvas>
 <div class=legend><span style="color:#f0a63a">■ $/5min</span></div>
@@ -285,24 +285,30 @@ async function refresh(){
    '<tr><td>'+f.time+'</td><td>'+f.outcome+'</td><td class="'+(f.side==='BUY'?'buy':'sell')+'">'+f.side+'</td>'
    +'<td>'+f.size+'</td><td>'+f.price+'</td><td>$'+(f.size*f.price).toFixed(2)+'</td></tr>'
  ).join(''):'<tr><td colspan=6 style="color:#6b7482">No fills yet</td></tr>';
- renderChart('chart', s.history, [{idx:3,color:'#b07cd8',w:2.4},{idx:2,color:'#2E86DE',w:1.4},{idx:1,color:'#3ddc84',w:1.4}]);
- renderChart('rateChart', s.rateHistory, [{idx:1,color:'#f0a63a',w:1.8}]);
+ renderChart('chart', s.history, [{idx:2,color:'#2E86DE',w:1.8,label:'account value'}], false);
+ renderChart('rewardChart', s.history, [{idx:1,color:'#3ddc84',w:1.4,label:'rewards'}]);
+ renderChart('rateChart', s.rateHistory, [{idx:1,color:'#f0a63a',w:1.8,label:'$/5min'}]);
 }
 function fmtTime(ts){return new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+function fmtTimeSec(ts){return new Date(ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 function fmtMoney(v){return (v>=0?'$':'-$')+Math.abs(v).toFixed(2)}
-function renderChart(id, hist, series){
+function fmtMoneyPrecise(v){return (v>=0?'$':'-$')+Math.abs(v).toFixed(4)}
+const lastData={}, hoverIdx={};
+function renderChart(id, hist, series, zeroBase=true){
  const cv=document.getElementById(id);const W=cv.width=cv.clientWidth;const H=cv.height=260;
  const g=cv.getContext('2d');g.clearRect(0,0,W,H);
  const L=52,R=10,T=10,B=22;
  const t1=Date.now()/1000, t0=t1-CHART_WINDOW_H*3600;
  const pts=(hist||[]).filter(s=>s[0]>=t0);
+ lastData[id]={hist,series,zeroBase,pts};
  g.font='11px -apple-system,sans-serif';
  if(!pts.length){
    g.fillStyle='#6b7482';g.fillText('No data in the last '+CHART_WINDOW_H+'h yet', L, H/2);
    return;
  }
- let vals=[0];pts.forEach(s=>series.forEach(sr=>vals.push(s[sr.idx])));
+ let vals=zeroBase?[0]:[];pts.forEach(s=>series.forEach(sr=>vals.push(s[sr.idx])));
  let lo=Math.min(...vals),hi=Math.max(...vals);if(hi-lo<1e-6){hi=lo+1}
+ if(!zeroBase){const pad=(hi-lo)*0.1;lo-=pad;hi+=pad}
  const X=t=>L+(t-t0)/(t1-t0)*(W-L-R);
  const Y=v=>H-B-(v-lo)/(hi-lo)*(H-T-B);
  for(let i=0;i<=4;i++){
@@ -321,7 +327,48 @@ function renderChart(id, hist, series){
    pts.forEach((s,i)=>{i?g.lineTo(X(s[0]),Y(s[sr.idx])):g.moveTo(X(s[0]),Y(s[sr.idx]))});
    g.stroke();
  });
+ const hoverI=hoverIdx[id];
+ if(hoverI!=null&&pts[hoverI]){
+   const s=pts[hoverI],x=X(s[0]);
+   g.strokeStyle='#4a5468';g.lineWidth=1;g.setLineDash([3,3]);
+   g.beginPath();g.moveTo(x,T);g.lineTo(x,H-B);g.stroke();g.setLineDash([]);
+   series.forEach(sr=>{
+     g.fillStyle=sr.color;g.beginPath();g.arc(x,Y(s[sr.idx]),3.2,0,Math.PI*2);g.fill();
+     g.strokeStyle='#0f1419';g.lineWidth=1;g.stroke();
+   });
+   const lines=[fmtTimeSec(s[0])].concat(series.map(sr=>sr.label+' '+fmtMoneyPrecise(s[sr.idx])));
+   g.font='11px -apple-system,sans-serif';
+   const tw=Math.max(...lines.map(l=>g.measureText(l).width))+16;
+   const th=lines.length*15+8;
+   let tx=x+10;if(tx+tw>W-R)tx=x-10-tw;
+   const ty=T+4;
+   g.fillStyle='rgba(26,33,43,0.95)';g.beginPath();g.rect(tx,ty,tw,th);g.fill();
+   g.strokeStyle='#333d4b';g.lineWidth=1;g.stroke();
+   lines.forEach((l,i)=>{g.fillStyle=i===0?'#8a93a2':'#e6e6e6';g.fillText(l,tx+8,ty+15+i*15)});
+ }
 }
+function bindHover(id){
+ const cv=document.getElementById(id);
+ cv.addEventListener('mousemove',e=>{
+   const d=lastData[id];if(!d||!d.pts||!d.pts.length)return;
+   const rect=cv.getBoundingClientRect();
+   const mx=(e.clientX-rect.left)*(cv.width/rect.width);
+   const L=52,R=10,t1=Date.now()/1000,t0=t1-CHART_WINDOW_H*3600;
+   const pts=d.pts;
+   const X=t=>L+(t-t0)/(t1-t0)*(cv.width-L-R);
+   let bestI=0,bestD=Infinity;
+   pts.forEach((s,i)=>{const dist=Math.abs(X(s[0])-mx);if(dist<bestD){bestD=dist;bestI=i}});
+   if(bestI===hoverIdx[id])return;
+   hoverIdx[id]=bestI;
+   renderChart(id,d.hist,d.series,d.zeroBase);
+ });
+ cv.addEventListener('mouseleave',()=>{
+   if(hoverIdx[id]==null)return;
+   hoverIdx[id]=null;
+   const d=lastData[id];if(d)renderChart(id,d.hist,d.series,d.zeroBase);
+ });
+}
+bindHover('chart');bindHover('rewardChart');bindHover('rateChart');
 setInterval(refresh,3000);refresh();
 </script></body></html>"""
 
@@ -345,7 +392,7 @@ def makeHandler(bot: BotManager, stats: Stats):
             if self.path == "/":
                 self._send(200, PAGE, "text/html")
             elif self.path == "/api/stats":
-                self._send(200, json.dumps(stats.snapshot))
+                self._send(200, stats.snapshotJson)
             else:
                 self._send(404, "{}")
 

@@ -45,32 +45,21 @@ def main():
     usdc = w3.eth.contract(address=USDC_ADDRESS, abi=ERC20_ABI)
     ctf = w3.eth.contract(address=CTF_ADDRESS, abi=ERC1155_ABI)
 
-    for name, spender in SPENDERS:
-        # 1. Approve USDC.e
-        print(f"[1/2] Approve USDC.e → {name}...")
-        nonce = w3.eth.get_transaction_count(pubKey)
-        txn = usdc.functions.approve(spender, MAX_UINT).build_transaction({
+    def sendTx(fnCall, desc):
+        print(desc)
+        txn = fnCall.build_transaction({
             "chainId": 137,
             "from": pubKey,
-            "nonce": nonce,
+            "nonce": w3.eth.get_transaction_count(pubKey),
         })
         signed = w3.eth.account.sign_transaction(txn, private_key=privKey)
         txHash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(txHash, 600)
         print(f"  OK tx: {receipt.transactionHash.hex()}")
 
-        # 2. Approve Conditional Token (ERC1155)
-        print(f"[2/2] Approve CTF → {name}...")
-        nonce = w3.eth.get_transaction_count(pubKey)
-        txn = ctf.functions.setApprovalForAll(spender, True).build_transaction({
-            "chainId": 137,
-            "from": pubKey,
-            "nonce": nonce,
-        })
-        signed = w3.eth.account.sign_transaction(txn, private_key=privKey)
-        txHash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(txHash, 600)
-        print(f"  OK tx: {receipt.transactionHash.hex()}")
+    for name, spender in SPENDERS:
+        sendTx(usdc.functions.approve(spender, MAX_UINT), f"[1/2] Approve USDC.e → {name}...")
+        sendTx(ctf.functions.setApprovalForAll(spender, True), f"[2/2] Approve CTF → {name}...")
 
     print("\nAll approvals done! You can place orders now.")
 

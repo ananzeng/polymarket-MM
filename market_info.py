@@ -7,7 +7,6 @@ Uses only the public Gamma API (no wallet / proxy needed).
 Run: venv/bin/python market_info.py <polymarket-url>
 """
 import argparse
-import json
 import re
 
 from polymarket_data import fetchEventBySlug
@@ -103,8 +102,7 @@ def main():
     print(f"  tick              : {info['tick']}")
     print(f"  midpoint          : {info['mid']:.4f}" + ("" if 0.10 <= info["mid"] <= 0.90
           else "  ⚠️ outside [0.10,0.90]: single-sided won't score, needs two-sided"))
-    print(f"  negRisk           : {info['negRisk']}   "
-          + ("(compatible with bot)" if info["negRisk"] else "⚠️ NOT negRisk — bot hardcodes neg_risk=True, needs a code tweak"))
+    print(f"  negRisk           : {info['negRisk']}   (bot reads this from the event automatically)")
 
     if rewarded:
         print("\n=== suggested settings ===")

@@ -29,6 +29,7 @@ Polymarket 對「在點差內掛單」的 maker 發放每日獎勵：
 | `MARKET_SLUG` | `nba-lebron-james-next-team` | 目標事件 slug |
 | `MARKET_MATCH` | `Cleveland Cavaliers` | 用來在事件內定位子市場的 question 關鍵字 |
 | `OFFSET_CENTS` | `1.0` | 掛單距中間價的點差（¢）。越小獎勵越高但越易被吃，需 ≤ 市場 max spread |
+| `MAX_SPREAD_CENTS` | `0.2` | 市場本身盤口（best bid/ask）點差上限（¢）。超過就跳過該輪掛單，盤口太薄時避免一掛就變成最佳價、被優先吃到 |
 | `ORDER_SIZE` | `200` | 每邊掛單股數，需 ≥ 市場 `rewardsMinSize` 才計獎勵 |
 | `REFRESH_INTERVAL` | `15` | 主單掛滿多久重掛（秒）。**訂單要掛 ≥ ~25 秒才會被 Polymarket 抽樣計分**，太短賺不到獎勵 |
 | `COOLDOWN` | `60` | 被吃單後的冷卻秒數（期間點差加倍） |
