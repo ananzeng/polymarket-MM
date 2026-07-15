@@ -218,8 +218,6 @@ button.stop{background:#c0392b} button:disabled{opacity:.4;cursor:default}
 .pos{color:#3ddc84}.neg{color:#ff5d5d}
 table{border-collapse:collapse;font-size:13px}td{padding:2px 10px 2px 0;color:#c9d1dc}
 #chart,#rewardChart,#rateChart{width:100%;height:260px;background:#1a212b;border-radius:10px;margin-top:12px;cursor:crosshair}
-.chartRow{display:flex;gap:12px}
-.chartCol{flex:1;min-width:0}
 .legend{font-size:12px;color:#8a93a2;margin-top:6px}
 .legend span{margin-right:16px}
 h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
@@ -247,14 +245,13 @@ h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
 <h3>Recent fills (from Polymarket trade records)</h3>
 <div class=fillsBox><table><thead><tr><th>Time</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th></tr></thead>
 <tbody id=fillsBody></tbody></table></div>
-<h3>Account value &amp; rewards (last __CHART_WINDOW_H__h)</h3>
-<div class=chartRow>
-<div class=chartCol><canvas id=chart></canvas><div class=legend><span style="color:#2E86DE">■ account value</span></div></div>
-<div class=chartCol><canvas id=rewardChart></canvas><div class=legend><span style="color:#3ddc84">■ rewards</span></div></div>
-</div>
-<h3>Reward rate over time (last __CHART_WINDOW_H__h, $/5min, snapshot every 5min)</h3>
+<h3>Account value, rewards &amp; reward rate (last __CHART_WINDOW_H__h)</h3>
+<canvas id=chart></canvas>
+<div class=legend><span style="color:#2E86DE">■ account value</span></div>
+<canvas id=rewardChart></canvas>
+<div class=legend><span style="color:#3ddc84">■ rewards</span></div>
 <canvas id=rateChart></canvas>
-<div class=legend><span style="color:#f0a63a">■ $/5min</span></div>
+<div class=legend><span style="color:#f0a63a">■ $/5min (snapshot every 5min)</span></div>
 <script>
 const CHART_WINDOW_H = __CHART_WINDOW_H__;
 async function ctl(a){await fetch('/api/'+a,{method:'POST'});setTimeout(refresh,600)}
