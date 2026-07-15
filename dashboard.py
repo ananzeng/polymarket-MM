@@ -5,10 +5,10 @@ and order scoring, with Start/Stop control.
 Run: venv/bin/python dashboard.py    then open http://localhost:8000
 Ctrl+C stops the bot, cancels all orders, and flattens inventory.
 """
-import csv
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -25,8 +25,8 @@ PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 STATS_INTERVAL = 12          # seconds between stats collections
 RATE_WINDOW = 900            # sliding window (s) for the reward-rate measurement
 RATE_LOG_INTERVAL = int(os.getenv("REWARD_RATE_LOG_INTERVAL", "300"))  # snapshot cadence (s)
-RATE_LOG_CSV = "reward_rate.csv"
-CHART_WINDOW_HOURS = int(os.getenv("CHART_WINDOW_HOURS", "12"))  # rolling time window shown on charts
+DB_PATH = os.path.join(lm.logDir, "dashboard.db")
+CHART_WINDOW_HOURS = int(os.getenv("CHART_WINDOW_HOURS", "48"))  # rolling time window shown on charts
 RECENT_FILLS_LIMIT = 20
 SAMPLES_MAXLEN = int(CHART_WINDOW_HOURS * 3600 / STATS_INTERVAL) + 50
 
@@ -68,12 +68,20 @@ class Stats:
         self.funder = lm.getFunder()
         self.rewardHist = deque(maxlen=600)   # (ts, cumRewardToday)
         self.samples = deque(maxlen=SAMPLES_MAXLEN)  # (ts, rewardToday, accountValue) for the chart
-        self.rateLogPath = os.path.join(lm.logDir, RATE_LOG_CSV)
         self.rateSnapshots = deque(maxlen=2000)  # (ts, per5min, perHour, perDay) for the rate chart
         self.lastRateLogTs = 0.0
         self.snapshot = {}
         self.snapshotJson = "{}"
-        self._loadTodayRateSnapshots()
+        os.makedirs(lm.logDir, exist_ok=True)
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS samples(
+                epoch REAL PRIMARY KEY, isoTime TEXT, reward REAL, accountValue REAL);
+            CREATE TABLE IF NOT EXISTS rateSnapshots(
+                epoch REAL PRIMARY KEY, isoTime TEXT, per5min REAL, perHour REAL, perDay REAL);
+        """)
+        self.db.commit()
+        self._loadDb()
 
     def loop(self):
         while True:
@@ -90,29 +98,29 @@ class Stats:
         noBal = lm.getBalanceShares(self.bot.client, self.bot.market["noToken"])
         return usdc + yesBal * mid + noBal * (1 - mid)
 
-    def _loadTodayRateSnapshots(self):
-        """Preload today's snapshots so the rate chart survives a dashboard restart."""
-        if not os.path.exists(self.rateLogPath):
-            return
-        todayStr = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        with open(self.rateLogPath, newline="") as f:
-            for row in csv.DictReader(f):
-                if not row.get("time", "").startswith(todayStr):
-                    continue
-                try:
-                    self.rateSnapshots.append((
-                        float(row["epoch"]), float(row["per5min"]),
-                        float(row["perHour"]), float(row["perDay"]),
-                    ))
-                except (KeyError, ValueError):
-                    continue
+    def _loadDb(self):
+        """Preload recent rows within the chart window so charts survive a restart."""
+        cutoff = time.time() - CHART_WINDOW_HOURS * 3600
+        for epoch, reward, accountValue in self.db.execute(
+                "SELECT epoch, reward, accountValue FROM samples WHERE epoch>=? ORDER BY epoch", (cutoff,)):
+            self.samples.append((epoch, reward, accountValue))
+        for epoch, per5min, perHour, perDay in self.db.execute(
+                "SELECT epoch, per5min, perHour, perDay FROM rateSnapshots WHERE epoch>=? ORDER BY epoch", (cutoff,)):
+            self.rateSnapshots.append((epoch, per5min, perHour, perDay))
 
     def _logRateSnapshot(self, ts: float, per5min: float, perHour: float, perDay: float):
-        lm.appendCsvRow(self.rateLogPath,
-                        ["time", "epoch", "market", "per5min", "perHour", "perDay"],
-                        [datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat(),
-                         ts, self.bot.market["question"], per5min, perHour, perDay])
+        iso = datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat()
+        self.db.execute("INSERT OR REPLACE INTO rateSnapshots VALUES(?,?,?,?,?)",
+                        (ts, iso, per5min, perHour, perDay))
+        self.db.commit()
         self.rateSnapshots.append((ts, per5min, perHour, perDay))
+
+    def _logSample(self, ts: float, reward: float, accountValue: float):
+        iso = datetime.fromtimestamp(ts, lm.TZ_UTC8).isoformat()
+        self.db.execute("INSERT OR REPLACE INTO samples VALUES(?,?,?,?)",
+                        (ts, iso, reward, accountValue))
+        self.db.commit()
+        self.samples.append((ts, reward, accountValue))
 
     def _collect(self):
         now = time.time()
@@ -152,7 +160,7 @@ class Stats:
         accountValue = self._accountValue(mid)
 
         net = reward + tradingToday
-        self.samples.append((now, round(reward, 4), round(accountValue, 4)))
+        self._logSample(now, round(reward, 4), round(accountValue, 4))
 
         maker = self.bot.maker
         elapsedH = max((now - dayStart) / 3600, 0.1)
