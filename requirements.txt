@@ -3,3 +3,4 @@ py-clob-client-v2==1.0.2
 python-dotenv==1.2.2
 web3==7.14.1
 matplotlib==3.10.8
+websocket-client==1.9.0

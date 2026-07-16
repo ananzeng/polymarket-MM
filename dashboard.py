@@ -176,6 +176,7 @@ class Stats:
                 "scoring": maker.lastScoring if maker else {},
                 "scoringAge": round(now - maker.lastScoringTs) if maker and maker.lastScoringTs else None,
                 "cooldown": max(0, round(maker.cooldownUntil - now)) if maker else 0,
+                "wsConnected": (maker.fillFeed.connected if (maker and maker.fillFeed) else None),
             },
             "rewards": {
                 "today": round(reward, 4),
@@ -231,7 +232,7 @@ h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
 <div class=bar>
 <button id=btnStart onclick="ctl('start')">Start</button>
 <button id=btnStop class=stop onclick="ctl('stop')">Stop</button>
-<span id=status class=badge></span> <span id=mode class=badge></span> <span id=cool class=badge></span>
+<span id=status class=badge></span> <span id=mode class=badge></span> <span id=ws class=badge></span> <span id=cool class=badge></span>
 </div>
 <div class=cards>
 <div class=card><h2>Reward rate (market CP)</h2><div class=big id=r5>–</div>
@@ -266,6 +267,9 @@ async function refresh(){
  st.className='badge '+(s.bot.running?'on':'off');
  document.getElementById('mode').textContent=s.bot.mode;
  document.getElementById('mode').className='badge on';
+ const w=document.getElementById('ws');
+ w.textContent=s.bot.wsConnected==null?'':(s.bot.wsConnected?'WS ✓':'WS ✗');
+ w.className='badge '+(s.bot.wsConnected==null?'':(s.bot.wsConnected?'on':'off'));
  const c=document.getElementById('cool');
  c.textContent=s.bot.cooldown>0?('cooldown '+s.bot.cooldown+'s'):'';c.className=s.bot.cooldown>0?'badge off':'badge';
  document.getElementById('btnStart').disabled=s.bot.running;

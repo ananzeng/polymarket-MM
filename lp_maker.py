@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 
 from polymarket_data import CLOB_URL, fetchEventBySlug, parseJsonList
 from notifier import sendTelegram
+from ws_fills import FillFeed
 from py_clob_client_v2 import (
     AssetType, BalanceAllowanceParams, ClobClient, MarketOrderArgs, OpenOrderParams,
     OrderArgs, OrderMarketCancelParams, OrdersScoringParams, OrderType,
@@ -51,6 +52,12 @@ baitSize = float(os.getenv("BAIT_SIZE", "15"))
 baitTriggerRatio = float(os.getenv("BAIT_TRIGGER_RATIO", "0.5"))
 tripPauseSeconds = int(os.getenv("TRIP_PAUSE_SECONDS", "30"))
 pollInterval = float(os.getenv("POLL_INTERVAL", "1.0"))
+
+# Real-time fill feed over the user WebSocket (opt-in). When off, fill detection stays on
+# REST polling; when on, WS is the fast path with REST reconciliation as a backstop.
+wsEnabled = os.getenv("WS_ENABLED", "false").lower() == "true"
+wsReconcileInterval = float(os.getenv("WS_RECONCILE_INTERVAL", "3.0"))
+wsUrl = os.getenv("WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user")
 
 # How often (seconds) to check whether the main orders are scoring (earning rewards); 0 disables.
 scoringCheckInterval = int(os.getenv("SCORING_CHECK_INTERVAL", "20"))
@@ -201,6 +208,10 @@ class PolymarketMaker:
         self.lastQuotes = {}
         self.lastScoring = {}
         self.lastScoringTs = 0.0
+        self.fillFeed = (FillFeed(client.creds, market["conditionId"],
+                                  os.environ.get("POLYMARKET_PROXY"), self.stopEvent, wsUrl)
+                         if (baitEnabled and wsEnabled) else None)
+        self._lastReconcile = 0.0
 
     def run(self):
         logger.info("Target market: %s", self.market["question"])
@@ -229,6 +240,8 @@ class PolymarketMaker:
 
         try:
             if baitEnabled:
+                if self.fillFeed:
+                    self.fillFeed.start()
                 self._runLayered()
             else:
                 self._runSimple()
@@ -252,13 +265,16 @@ class PolymarketMaker:
                 if not tracked:
                     self.stopEvent.wait(pollInterval)
                     continue
+                if self.fillFeed:
+                    self.fillFeed.setWatched(tracked.keys())
+                    self._lastReconcile = 0.0
                 deadline = time.time() + refreshInterval
                 lastScoringCheck = time.time()
                 tripped = False
                 while time.time() < deadline:
                     if self.stopEvent.wait(pollInterval):
                         break
-                    baitFilled, mainFilled = self._pollFills(tracked)
+                    baitFilled, mainFilled = self._readFills(tracked)
                     if mainFilled > 0 or baitFilled >= baitTriggerRatio * baitSize:
                         logger.info("Bait tripped: baitFilled=%.2f mainFilled=%.2f -> retreat",
                                     baitFilled, mainFilled)
@@ -388,15 +404,38 @@ class PolymarketMaker:
                 tracked[oid] = {"kind": kind, "size": size, "label": label}
         return tracked
 
-    def _pollFills(self, tracked: dict):
-        """Return (baitFilledShares, mainFilledShares) across the tracked orders."""
-        openOrders = self.client.get_open_orders(OpenOrderParams(market=self.market["conditionId"]))
-        matched = {o["id"]: float(o.get("size_matched", 0) or 0) for o in openOrders}
+    def _readFills(self, tracked: dict):
+        """Fill totals for this cycle. When WS is enabled it is the fast path; REST reconciles
+        every wsReconcileInterval as a backstop, and drives detection outright whenever WS is
+        disabled or disconnected."""
+        if not (wsEnabled and self.fillFeed):
+            return self._pollFills(tracked)
+        now = time.time()
+        if (not self.fillFeed.connected) or (now - self._lastReconcile >= wsReconcileInterval):
+            self._lastReconcile = now
+            self.fillFeed.reconcile(self._restMatchedMap(tracked))
+        return self._sumByKind(tracked, self.fillFeed.snapshot(tracked.keys()))
 
+    def _pollFills(self, tracked: dict):
+        """Return (baitFilledShares, mainFilledShares) via a REST snapshot only."""
+        return self._sumByKind(tracked, self._restMatchedMap(tracked))
+
+    def _restMatchedMap(self, tracked: dict) -> dict:
+        """{orderId: filledShares} from get_open_orders, falling back to a single-order lookup
+        for ids that have dropped off the open-orders list (filled vs not-yet-indexed)."""
+        requestStart = time.time()
+        openOrders = self.client.get_open_orders(OpenOrderParams(market=self.market["conditionId"]))
+        logger.debug("get_open_orders RTT=%.1fms", (time.time() - requestStart) * 1000)
+        matched = {o["id"]: float(o.get("size_matched", 0) or 0) for o in openOrders}
+        return {oid: (matched[oid] if oid in matched else self._confirmFilled(oid, info["label"]))
+                for oid, info in tracked.items()}
+
+    def _sumByKind(self, tracked: dict, perOid: dict):
+        """Aggregate per-order filled shares into (baitFilled, mainFilled)."""
         baitFilled = 0.0
         mainFilled = 0.0
         for oid, info in tracked.items():
-            filled = matched[oid] if oid in matched else self._confirmFilled(oid, info["label"])
+            filled = perOid.get(oid, 0.0)
             if info["kind"] == "bait":
                 baitFilled += filled
             else:
@@ -426,6 +465,8 @@ class PolymarketMaker:
 
     def shutdown(self):
         """Cancel all orders and flatten any inventory; used by external controllers (dashboard)."""
+        if self.fillFeed:
+            self.fillFeed.stop()
         self._cancelAll()
         self._flattenInventory()
 
