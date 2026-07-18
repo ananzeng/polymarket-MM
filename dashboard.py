@@ -125,10 +125,14 @@ class Stats:
     def _collect(self):
         now = time.time()
         nowUtc = datetime.now(timezone.utc)
+        dayStart = dayStartUtc(nowUtc)
 
         reward = rewardForDay(self.bot.client, nowUtc.strftime("%Y-%m-%d"))
         self.rewardHist.append((now, reward))
-        base = next((s for s in self.rewardHist if s[0] >= now - RATE_WINDOW), self.rewardHist[0])
+        # Only look back within the current UTC day: rewardForDay resets to 0 at UTC midnight,
+        # so a base from the previous day would make the rate spike sharply negative.
+        base = next((s for s in self.rewardHist if s[0] >= max(now - RATE_WINDOW, dayStart)),
+                    self.rewardHist[0])
         dt = now - base[0]
         ratePerSec = (reward - base[1]) / dt if dt >= 30 else 0.0
         per5min, perHour, perDay = ratePerSec * 300, ratePerSec * 3600, ratePerSec * 86400
@@ -139,7 +143,6 @@ class Stats:
 
         trades = self.bot.client.get_trades(TradeParams(market=self.bot.market["conditionId"]))
         fills = userFills(trades, self.funder)
-        dayStart = dayStartUtc(nowUtc)
         todayFills = [f for f in fills if f[0] >= dayStart]
 
         mid = (self.bot.maker.lastMid if self.bot.maker and self.bot.maker.lastMid else 0.5)
