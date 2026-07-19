@@ -180,6 +180,9 @@ class Stats:
                 "scoringAge": round(now - maker.lastScoringTs) if maker and maker.lastScoringTs else None,
                 "cooldown": max(0, round(maker.cooldownUntil - now)) if maker else 0,
                 "wsConnected": (maker.fillFeed.connected if (maker and maker.fillFeed) else None),
+                "marketWsConnected": (maker.bookFeed.connected if (maker and maker.bookFeed) else None),
+                "cushionYes": maker.lastCushionYes if maker else None,
+                "cushionNo": maker.lastCushionNo if maker else None,
             },
             "rewards": {
                 "today": round(reward, 4),
@@ -235,7 +238,7 @@ h3{font-size:13px;color:#8a93a2;margin:20px 0 0;font-weight:500}
 <div class=bar>
 <button id=btnStart onclick="ctl('start')">Start</button>
 <button id=btnStop class=stop onclick="ctl('stop')">Stop</button>
-<span id=status class=badge></span> <span id=mode class=badge></span> <span id=ws class=badge></span> <span id=cool class=badge></span>
+<span id=status class=badge></span> <span id=mode class=badge></span> <span id=ws class=badge></span> <span id=mws class=badge></span> <span id=cool class=badge></span>
 </div>
 <div class=cards>
 <div class=card><h2>Reward rate (market CP)</h2><div class=big id=r5>–</div>
@@ -273,6 +276,10 @@ async function refresh(){
  const w=document.getElementById('ws');
  w.textContent=s.bot.wsConnected==null?'':(s.bot.wsConnected?'WS ✓':'WS ✗');
  w.className='badge '+(s.bot.wsConnected==null?'':(s.bot.wsConnected?'on':'off'));
+ const mw=document.getElementById('mws');
+ const cush=(s.bot.cushionYes!=null||s.bot.cushionNo!=null)?(' '+Math.round(s.bot.cushionYes||0)+'/'+Math.round(s.bot.cushionNo||0)):'';
+ mw.textContent=s.bot.marketWsConnected==null?'':((s.bot.marketWsConnected?'BOOK ✓':'BOOK ✗')+cush);
+ mw.className='badge '+(s.bot.marketWsConnected==null?'':(s.bot.marketWsConnected?'on':'off'));
  const c=document.getElementById('cool');
  c.textContent=s.bot.cooldown>0?('cooldown '+s.bot.cooldown+'s'):'';c.className=s.bot.cooldown>0?'badge off':'badge';
  document.getElementById('btnStart').disabled=s.bot.running;

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from polymarket_data import CLOB_URL, fetchEventBySlug, parseJsonList
 from notifier import sendTelegram
 from ws_fills import FillFeed
+from book_feed import BookFeed
 from py_clob_client_v2 import (
     AssetType, BalanceAllowanceParams, ClobClient, MarketOrderArgs, OpenOrderParams,
     OrderArgs, OrderMarketCancelParams, OrdersScoringParams, OrderType,
@@ -58,6 +59,20 @@ pollInterval = float(os.getenv("POLL_INTERVAL", "1.0"))
 wsEnabled = os.getenv("WS_ENABLED", "false").lower() == "true"
 wsReconcileInterval = float(os.getenv("WS_RECONCILE_INTERVAL", "3.0"))
 wsUrl = os.getenv("WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user")
+
+# Market-channel book feed (opt-in, independent of WS_ENABLED). Proactive retreat: watch the
+# whole market's real depth cushion above the main order plus a live mid, and retreat on
+# telegraphed selling pressure BEFORE a sweep reaches the main order. Only active in bait mode.
+# HONEST CEILING: a single atomic sweep is still unbeatable — the market event is a post-match
+# notification, same as a fill; this only lowers probability/loss on telegraphed pressure, not to
+# zero. First phase drives retreat only, never quoting (quoting stays on the per-cycle REST mid).
+marketWsEnabled     = os.getenv("MARKET_WS_ENABLED", "false").lower() == "true"
+marketWsUrl         = os.getenv("MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
+marketWsObserveOnly = os.getenv("MARKET_WS_OBSERVE_ONLY", "false").lower() == "true"
+depthRetreatRatio   = float(os.getenv("DEPTH_RETREAT_RATIO", "0.5"))
+depthMinBaseline    = float(os.getenv("DEPTH_MIN_BASELINE", "200"))
+midMoveRetreatCents = float(os.getenv("MID_MOVE_RETREAT_CENTS", "0.5"))
+marketSignalPersist = int(os.getenv("MARKET_SIGNAL_PERSIST_POLLS", "4"))
 
 # How often (seconds) to check whether the main orders are scoring (earning rewards); 0 disables.
 scoringCheckInterval = int(os.getenv("SCORING_CHECK_INTERVAL", "20"))
@@ -211,6 +226,11 @@ class PolymarketMaker:
         self.fillFeed = (FillFeed(client.creds, market["conditionId"],
                                   os.environ.get("POLYMARKET_PROXY"), self.stopEvent, wsUrl)
                          if (baitEnabled and wsEnabled) else None)
+        self.bookFeed = (BookFeed([market["yesToken"], market["noToken"]],
+                                  os.environ.get("POLYMARKET_PROXY"), self.stopEvent, marketWsUrl)
+                         if (baitEnabled and marketWsEnabled) else None)
+        self.lastCushionYes = None
+        self.lastCushionNo = None
         self._lastReconcile = 0.0
 
     def run(self):
@@ -242,6 +262,8 @@ class PolymarketMaker:
             if baitEnabled:
                 if self.fillFeed:
                     self.fillFeed.start()
+                if self.bookFeed:
+                    self.bookFeed.start()
                 self._runLayered()
             else:
                 self._runSimple()
@@ -268,6 +290,13 @@ class PolymarketMaker:
                 if self.fillFeed:
                     self.fillFeed.setWatched(tracked.keys())
                     self._lastReconcile = 0.0
+                # Proactive market-channel signal: baseline captured per cycle (reset like
+                # fillFeed.setWatched), never carried across cycles. Inert when bookFeed is off.
+                quotedMid = self.lastMid
+                mainYesPx = self.lastQuotes.get("main Yes")
+                mainNoPx = self.lastQuotes.get("main No")
+                cushionBase = self._captureCushionBaseline(mainYesPx, mainNoPx)
+                signalStreak = 0
                 deadline = time.time() + refreshInterval
                 lastScoringCheck = time.time()
                 tripped = False
@@ -283,6 +312,22 @@ class PolymarketMaker:
                                      f"主單={mainFilled:.1f} 股 — 撤退中")
                         tripped = True
                         break
+                    # Proactive book signal shares the SAME retreat path as the bait trip. Requires
+                    # marketSignalPersist consecutive polls (anti-whipsaw); observe-only just logs.
+                    reason = self._marketSignalReason(quotedMid, mainYesPx, mainNoPx, cushionBase)
+                    signalStreak = signalStreak + 1 if reason else 0
+                    if signalStreak >= marketSignalPersist:
+                        if marketWsObserveOnly:
+                            logger.info("Market-signal WOULD retreat (observe-only) after %d polls: %s",
+                                        signalStreak, reason)
+                            signalStreak = 0   # re-arm; don't log every poll while pressure persists
+                        else:
+                            logger.info("Market-signal tripped after %d polls: %s -> retreat",
+                                        signalStreak, reason)
+                            playAlertSound()
+                            sendTelegram(f"🛡️ 盤口預警撤退 ({marketMatch})：{reason}")
+                            tripped = True
+                            break
                     if scoringCheckInterval and time.time() - lastScoringCheck >= scoringCheckInterval:
                         self._checkScoring(tracked)
                         lastScoringCheck = time.time()
@@ -467,6 +512,8 @@ class PolymarketMaker:
         """Cancel all orders and flatten any inventory; used by external controllers (dashboard)."""
         if self.fillFeed:
             self.fillFeed.stop()
+        if self.bookFeed:
+            self.bookFeed.stop()
         self._cancelAll()
         self._flattenInventory()
 
@@ -499,6 +546,62 @@ class PolymarketMaker:
             return None, None
         bestBid, bestAsk = max(bids), min(asks)
         return (bestBid + bestAsk) / 2, (bestAsk - bestBid) * 100
+
+    def _captureCushionBaseline(self, mainYesPx, mainNoPx):
+        """Per-cycle baseline of the live buy-depth cushion above each main order — what the
+        retreat signal compares the live cushion against. Returns None (signal unavailable, never
+        wrong) when the book feed is off / disconnected / missing a snapshot for either token."""
+        feed = self.bookFeed
+        if not (feed and feed.connected) or mainYesPx is None or mainNoPx is None:
+            return None
+        yesToken, noToken = self.market["yesToken"], self.market["noToken"]
+        if not (feed.hasSnapshot(yesToken) and feed.hasSnapshot(noToken)):
+            return None
+        base = {"Yes": feed.buyDepthAboveExcl(yesToken, mainYesPx),
+                "No": feed.buyDepthAboveExcl(noToken, mainNoPx)}
+        if base["Yes"] is None or base["No"] is None:
+            return None
+        logger.debug("Cushion baseline: Yes>%.4f=%.0f | No>%.4f=%.0f",
+                     mainYesPx, base["Yes"], mainNoPx, base["No"])
+        return base
+
+    def _marketSignalReason(self, quotedMid, mainYesPx, mainNoPx, cushionBase):
+        """Proactive retreat check from the in-memory order book (no REST). Returns a
+        human-readable reason string when either signal fires, else None. Short-circuits to None
+        on a missing/disconnected feed so the bot falls back to bait + user-channel detection —
+        there is no hard dependency on the market feed."""
+        feed = self.bookFeed
+        if not (feed and feed.connected):
+            return None
+        yesToken, noToken = self.market["yesToken"], self.market["noToken"]
+
+        # 1) live mid drift vs the mid we quoted this cycle (main order resting on a stale price)
+        liveMid = feed.mid(yesToken)
+        if liveMid is not None and quotedMid is not None:
+            deltaCents = abs(liveMid - quotedMid) * 100
+            if deltaCents > midMoveRetreatCents:
+                return (f"live mid {liveMid:.4f} vs quoted {quotedMid:.4f} "
+                        f"({deltaCents:.2f}¢ > {midMoveRetreatCents}¢)")
+
+        # 2) cushion collapse on either side (buy depth a seller must eat before the main order)
+        if cushionBase:
+            for label, token, px in (("Yes", yesToken, mainYesPx), ("No", noToken, mainNoPx)):
+                if px is None or not feed.hasSnapshot(token):
+                    continue
+                live = feed.buyDepthAboveExcl(token, px)
+                if live is None:
+                    continue
+                if label == "Yes":
+                    self.lastCushionYes = live
+                else:
+                    self.lastCushionNo = live
+                base = cushionBase.get(label)
+                if base is None or base < depthMinBaseline:
+                    continue   # thin book: this signal is pure noise, skip it
+                if live < depthRetreatRatio * base:
+                    return (f"{label} cushion {live:.0f} < {depthRetreatRatio:.0%} of "
+                            f"baseline {base:.0f} (above {px:.4f})")
+        return None
 
     def _placeOrder(self, token: str, price: float, size: float, label: str):
         if dryRun:
